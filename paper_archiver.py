@@ -27,6 +27,7 @@ from PyQt5.QtWidgets import (
     QMessageBox,
     QPushButton,
     QProgressBar,
+    QListWidget,
     QTabWidget,
     QTextEdit,
     QVBoxLayout,
@@ -84,6 +85,7 @@ class PaperMetadata:
     authors: str = ""
     authors_zh: str = ""
     first_author: str = ""
+    corresponding_author: str = ""
     last_author: str = ""
     corresponding_author_affiliation: str = ""
     publisher: str = ""
@@ -112,6 +114,7 @@ class PaperItem:
     duplicate: bool = False
     json_payload: dict = field(default_factory=dict)
     note: str = ""
+    changed_fields: set[str] = field(default_factory=set)
 
 
 def load_config() -> dict:
@@ -155,6 +158,8 @@ def boolify(value: object) -> bool:
 
 
 def metadata_from_dict(data: dict) -> PaperMetadata:
+    if not isinstance(data, dict):
+        data = {}
     return PaperMetadata(
         is_paper=boolify(data.get("is_paper", True)),
         title=stringify(data.get("title")),
@@ -162,6 +167,11 @@ def metadata_from_dict(data: dict) -> PaperMetadata:
         authors=stringify(data.get("authors")),
         authors_zh=stringify(data.get("authors_zh") or data.get("chinese_authors")),
         first_author=stringify(data.get("first_author")),
+        corresponding_author=stringify(
+            data.get("corresponding_author")
+            or data.get("corresponding_authors")
+            or data.get("contact_author")
+        ),
         last_author=stringify(data.get("last_author")),
         corresponding_author_affiliation=stringify(
             data.get("corresponding_author_affiliation")
@@ -230,6 +240,7 @@ def build_prompt(pdf_text: str) -> str:
         "- authors: 全部作者，字符串数组或用逗号分隔的字符串。\n"
         "- authors_zh: 作者中文译名；无法可靠翻译时可照填原文。\n"
         "- first_author: 第一作者姓名。\n"
+        "- corresponding_author: 通讯作者姓名；无法确认则留空。\n"
         "- last_author: 最后一个作者姓名；如果最后一个作者不是通讯作者，也按最后作者填写。\n"
         "- corresponding_author_affiliation: 通讯作者单位；无法确认则留空。\n"
         "- publisher: 期刊/会议/出版社原文名称。\n"
@@ -353,7 +364,8 @@ def normalize_chat_completions_url(base_url: str) -> str:
 
 def read_metadata_file(path: Path) -> dict:
     with path.open("r", encoding="utf-8") as fh:
-        return json.load(fh)
+        data = json.load(fh)
+    return data if isinstance(data, dict) else {}
 
 
 def write_metadata_file(folder: Path, payload: dict) -> None:
@@ -372,15 +384,57 @@ def iter_archive_payloads(root_dir: Path):
             continue
 
 
-def find_duplicate(root_dir: Path, metadata: PaperMetadata | None = None):
+def payload_pdf_matches(payload: dict, paper_hash: str = "", pdf_path: Path | None = None) -> bool:
+    if paper_hash and payload.get("paper_hash") == paper_hash:
+        return True
+    candidate_paths = [
+        stringify(payload.get("source_pdf")),
+        stringify(payload.get("original_pdf")),
+        stringify(payload.get("pdf_path")),
+        stringify(payload.get("file_path")),
+    ]
+    resolved_pdf = None
+    if pdf_path:
+        try:
+            resolved_pdf = pdf_path.resolve()
+        except OSError:
+            resolved_pdf = pdf_path
+    for candidate in candidate_paths:
+        if not candidate:
+            continue
+        archived_pdf = Path(candidate)
+        if resolved_pdf:
+            try:
+                if archived_pdf.resolve() == resolved_pdf:
+                    return True
+            except OSError:
+                pass
+        if paper_hash and archived_pdf.exists():
+            try:
+                if pdf_hash(archived_pdf) == paper_hash:
+                    return True
+            except OSError:
+                pass
+    return False
+
+
+def find_duplicate(
+    root_dir: Path,
+    metadata: PaperMetadata | None = None,
+    paper_hash: str = "",
+    pdf_path: Path | None = None,
+):
     wanted_title = normalized_title(metadata.title if metadata else "")
     wanted_title_zh = normalized_title(metadata.title_zh if metadata else "")
-    if not (wanted_title or wanted_title_zh):
+    if not (wanted_title or wanted_title_zh or paper_hash or pdf_path):
         return None, None
     for folder, payload in iter_archive_payloads(root_dir):
+        if payload_pdf_matches(payload, paper_hash, pdf_path):
+            return folder, payload
+        payload_metadata = metadata_from_dict(payload)
         payload_titles = {
-            normalized_title(stringify(payload.get("title"))),
-            normalized_title(stringify(payload.get("title_zh"))),
+            normalized_title(payload_metadata.title),
+            normalized_title(payload_metadata.title_zh),
         }
         if (wanted_title and wanted_title in payload_titles) or (
             wanted_title_zh and wanted_title_zh in payload_titles
@@ -389,25 +443,84 @@ def find_duplicate(root_dir: Path, metadata: PaperMetadata | None = None):
     return None, None
 
 
+def merge_metadata_payload(
+    payload: dict,
+    metadata: PaperMetadata,
+    prompt: str,
+    pdf_path: Path,
+    paper_hash: str,
+    existing_note: str = "",
+) -> tuple[dict, set[str]]:
+    merged = dict(payload or {})
+    old_metadata = metadata_from_dict(merged)
+    new_values = asdict(metadata)
+    old_values = asdict(old_metadata)
+    changed_fields: set[str] = set()
+    for key, new_value in new_values.items():
+        old_value = old_values.get(key)
+        if isinstance(new_value, bool):
+            if new_value != old_value:
+                merged[key] = new_value
+                changed_fields.add(key)
+            continue
+        new_text = stringify(new_value)
+        old_text = stringify(old_value)
+        if new_text and new_text != old_text:
+            merged[key] = new_text
+            changed_fields.add(key)
+        else:
+            merged.setdefault(key, old_text)
+    merged["paper_hash"] = paper_hash
+    merged["original_pdf"] = str(pdf_path)
+    merged["model_prompt"] = prompt
+    if existing_note:
+        merged["manual_notes"] = existing_note
+    else:
+        merged.setdefault("manual_notes", stringify(payload.get("manual_notes")))
+    return merged, changed_fields
+
+
 def archive_paper(
     pdf_path: Path,
     root_dir: Path,
     metadata: PaperMetadata,
     prompt: str = "",
     existing_note: str = "",
-) -> tuple[Path, dict, bool]:
+) -> tuple[Path, dict, bool, set[str]]:
     root_dir.mkdir(parents=True, exist_ok=True)
     paper_hash = pdf_hash(pdf_path)
-    duplicate_folder, duplicate_payload = find_duplicate(root_dir, metadata)
+    duplicate_folder, duplicate_payload = find_duplicate(
+        root_dir, metadata, paper_hash, pdf_path
+    )
     if duplicate_folder and duplicate_payload:
-        return duplicate_folder, duplicate_payload, True
+        payload, changed_fields = merge_metadata_payload(
+            duplicate_payload, metadata, prompt, pdf_path, paper_hash, existing_note
+        )
+        if changed_fields or payload != duplicate_payload:
+            write_metadata_file(duplicate_folder, payload)
+        return duplicate_folder, payload, True, changed_fields
 
     title = compact_text(metadata.title or metadata.title_zh, pdf_path.stem, 72)
     first_author_source = metadata.first_author or metadata.authors.split(",")[0]
     first_author = compact_text(first_author_source, "unknown-author", 32)
-    year_match = re.search(r"(19|20)\d{2}", metadata.published_time)
-    year = year_match.group(0) if year_match else "unknown-year"
-    folder_name = compact_text(f"{year} {first_author} {title}", pdf_path.stem, 118)
+    corresponding_author_source = metadata.corresponding_author or metadata.last_author
+    corresponding_author = compact_text(
+        corresponding_author_source, "unknown-corresponding-author", 32
+    )
+    published_time = metadata.published_time
+    if not published_time:
+        year_match = re.search(r"(19|20)\d{2}", metadata.published_time)
+        published_time = year_match.group(0) if year_match else "unknown-time"
+    folder_name = "=".join(
+        compact_text(part, fallback, max_len)
+        for part, fallback, max_len in (
+            (published_time, "unknown-time", 24),
+            (first_author, "unknown-author", 32),
+            (corresponding_author, "unknown-corresponding-author", 32),
+            (title, pdf_path.stem, 72),
+        )
+    )
+    folder_name = compact_text(folder_name, pdf_path.stem, 156)
     folder = root_dir / folder_name
     for index in range(2, 1000):
         if not folder.exists():
@@ -432,7 +545,7 @@ def archive_paper(
         }
     )
     write_metadata_file(folder, payload)
-    return folder, payload, False
+    return folder, payload, False, set()
 
 
 def archive_statistics(root_dir: Path) -> dict:
@@ -615,12 +728,16 @@ class ParseWorker(QThread):
         total = len(self.pdf_paths)
         for index, pdf_path in enumerate(self.pdf_paths, start=1):
             try:
+                old_folder, old_payload = find_duplicate(
+                    self.archive_root, paper_hash=pdf_hash(pdf_path), pdf_path=pdf_path
+                )
                 text = extract_pdf_text(pdf_path)
                 prompt = build_prompt(text)
                 metadata = call_openai_compatible_api(prompt, self.config)
-                folder, payload, duplicate = archive_paper(
+                folder, payload, duplicate, changed_fields = archive_paper(
                     pdf_path, self.archive_root, metadata, prompt
                 )
+                duplicate = duplicate or bool(old_folder and old_payload)
                 item = PaperItem(
                     pdf_path=pdf_path,
                     metadata=metadata_from_dict(payload),
@@ -629,6 +746,7 @@ class ParseWorker(QThread):
                     duplicate=duplicate,
                     json_payload=payload,
                     note=stringify(payload.get("manual_notes")),
+                    changed_fields=changed_fields,
                 )
                 self.itemFinished.emit(index, total, item)
             except Exception as exc:
@@ -750,6 +868,10 @@ class MainWindow(QMainWindow):
         self.drop_area = DropArea()
         self.drop_area.pdfDropped.connect(self.set_pdfs)
         root.addWidget(self.drop_area)
+        self.pdf_list = QListWidget()
+        self.pdf_list.setMaximumHeight(120)
+        self.pdf_list.currentRowChanged.connect(self.on_pdf_list_row_changed)
+        root.addWidget(self.pdf_list)
 
         controls = QHBoxLayout()
         self.import_button = QPushButton("导入 PDF")
@@ -834,6 +956,7 @@ class MainWindow(QMainWindow):
         self.authors_edit = QLineEdit()
         self.authors_zh_edit = QLineEdit()
         self.first_author_edit = QLineEdit()
+        self.corresponding_author_edit = QLineEdit()
         self.last_author_edit = QLineEdit()
         self.corresponding_affiliation_edit = QLineEdit()
         self.publisher_edit = QLineEdit()
@@ -845,6 +968,7 @@ class MainWindow(QMainWindow):
         form.addRow("作者", self.authors_edit)
         form.addRow("作者中文", self.authors_zh_edit)
         form.addRow("第一作者", self.first_author_edit)
+        form.addRow("通讯作者", self.corresponding_author_edit)
         form.addRow("最后作者", self.last_author_edit)
         form.addRow("通讯作者单位", self.corresponding_affiliation_edit)
         form.addRow("出版社/期刊/会议", self.publisher_edit)
@@ -1041,9 +1165,47 @@ class MainWindow(QMainWindow):
     def set_pdfs(self, paths: list[str]) -> None:
         self.paper_items = [PaperItem(pdf_path=Path(path)) for path in paths]
         self.current_paper_index = 0
+        existing_count = 0
+        for item in self.paper_items:
+            if self.load_existing_for_item(item):
+                existing_count += 1
+        self.pdf_list.blockSignals(True)
+        self.pdf_list.clear()
+        for index, item in enumerate(self.paper_items, start=1):
+            self.pdf_list.addItem(f"{index}. {item.pdf_path.name}")
+        self.pdf_list.setCurrentRow(0 if self.paper_items else -1)
+        self.pdf_list.blockSignals(False)
         self.drop_area.setText(f"已导入 {len(paths)} 个 PDF")
-        self.status.setText(f"已导入 {len(paths)} 个 PDF，点击“大模型解析”后会自动归档。")
-        self.log_message(f"已导入 PDF 数量：{len(paths)}")
+        notice = f"，其中 {existing_count} 篇已读取旧 JSON" if existing_count else ""
+        self.status.setText(
+            f"已导入 {len(paths)} 个 PDF{notice}，点击“大模型解析”后会对比写入。"
+        )
+        self.log_message(f"已导入 PDF 数量：{len(paths)}{notice}")
+        self.update_current_view()
+
+    def load_existing_for_item(self, item: PaperItem) -> bool:
+        try:
+            folder, payload = find_duplicate(
+                self.archive_root(), paper_hash=pdf_hash(item.pdf_path), pdf_path=item.pdf_path
+            )
+        except OSError:
+            return False
+        if not folder or not payload:
+            return False
+        item.metadata = metadata_from_dict(payload)
+        item.prompt = stringify(payload.get("model_prompt"))
+        item.folder = folder
+        item.duplicate = True
+        item.json_payload = payload
+        item.note = stringify(payload.get("manual_notes"))
+        item.changed_fields = set()
+        return True
+
+    def on_pdf_list_row_changed(self, row: int) -> None:
+        if row < 0 or row >= len(self.paper_items):
+            return
+        self.sync_current_from_fields()
+        self.current_paper_index = row
         self.update_current_view()
 
     def choose_archive_root(self) -> None:
@@ -1084,7 +1246,11 @@ class MainWindow(QMainWindow):
     def on_item_finished(self, index: int, total: int, item: PaperItem) -> None:
         self.paper_items[index - 1] = item
         self.current_paper_index = index - 1
-        flag = "重复，已读取旧 JSON 和人工笔记" if item.duplicate else "解析完成"
+        if item.duplicate:
+            changed_count = len(item.changed_fields)
+            flag = f"重复，已读取旧 JSON，并用大模型结果更新 {changed_count} 个字段"
+        else:
+            flag = "解析完成"
         self.log_message(
             f"[{index}/{total}] {item.pdf_path.name}：{flag}；是否论文：{'是' if item.metadata.is_paper else '否'}"
         )
@@ -1123,10 +1289,14 @@ class MainWindow(QMainWindow):
         if not item:
             self.paper_position_label.setText("暂无论文")
             self.existing_notice.setText("")
-            self.apply_metadata(PaperMetadata(), "")
+            self.apply_metadata(PaperMetadata(), "", set())
             self.show_current_json()
             self.show_current_prompt()
             return
+        if self.pdf_list.currentRow() != self.current_paper_index:
+            self.pdf_list.blockSignals(True)
+            self.pdf_list.setCurrentRow(self.current_paper_index)
+            self.pdf_list.blockSignals(False)
         metadata = item.metadata
         title = metadata.title or metadata.title_zh or item.pdf_path.name
         self.paper_position_label.setText(
@@ -1137,16 +1307,19 @@ class MainWindow(QMainWindow):
             if item.duplicate and item.folder
             else ""
         )
-        self.apply_metadata(metadata, item.note)
+        self.apply_metadata(metadata, item.note, item.changed_fields)
         self.show_current_json()
         self.show_current_prompt()
 
-    def apply_metadata(self, metadata: PaperMetadata, note: str) -> None:
+    def apply_metadata(
+        self, metadata: PaperMetadata, note: str, changed_fields: set[str] | None = None
+    ) -> None:
         self.title_edit.setText(metadata.title)
         self.title_zh_edit.setText(metadata.title_zh)
         self.authors_edit.setText(metadata.authors)
         self.authors_zh_edit.setText(metadata.authors_zh)
         self.first_author_edit.setText(metadata.first_author)
+        self.corresponding_author_edit.setText(metadata.corresponding_author)
         self.last_author_edit.setText(metadata.last_author)
         self.corresponding_affiliation_edit.setText(metadata.corresponding_author_affiliation)
         self.publisher_edit.setText(metadata.publisher)
@@ -1156,6 +1329,32 @@ class MainWindow(QMainWindow):
         self.abstract_en_edit.setPlainText(metadata.abstract_en)
         self.plain_summary_edit.setPlainText(metadata.plain_language_summary)
         self.note_edit.setPlainText(note)
+        self.highlight_changed_fields(changed_fields or set())
+
+    def highlight_changed_fields(self, changed_fields: set[str]) -> None:
+        widgets = {
+            "title": self.title_edit,
+            "title_zh": self.title_zh_edit,
+            "authors": self.authors_edit,
+            "authors_zh": self.authors_zh_edit,
+            "first_author": self.first_author_edit,
+            "corresponding_author": self.corresponding_author_edit,
+            "last_author": self.last_author_edit,
+            "corresponding_author_affiliation": self.corresponding_affiliation_edit,
+            "publisher": self.publisher_edit,
+            "publisher_zh": self.publisher_zh_edit,
+            "published_time": self.time_edit,
+            "abstract_zh": self.abstract_zh_edit,
+            "abstract_en": self.abstract_en_edit,
+            "plain_language_summary": self.plain_summary_edit,
+        }
+        for field, widget in widgets.items():
+            if field in changed_fields:
+                widget.setStyleSheet(
+                    "background: #fee2e2; border: 1px solid #ef4444; border-radius: 6px; padding: 6px;"
+                )
+            else:
+                widget.setStyleSheet("")
 
     def current_metadata(self) -> PaperMetadata:
         return PaperMetadata(
@@ -1165,6 +1364,7 @@ class MainWindow(QMainWindow):
             authors=self.authors_edit.text().strip(),
             authors_zh=self.authors_zh_edit.text().strip(),
             first_author=self.first_author_edit.text().strip(),
+            corresponding_author=self.corresponding_author_edit.text().strip(),
             last_author=self.last_author_edit.text().strip(),
             corresponding_author_affiliation=self.corresponding_affiliation_edit.text().strip(),
             publisher=self.publisher_edit.text().strip(),
@@ -1194,7 +1394,7 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "缺少题目", "请先解析或手动填写论文题目。")
             return
         try:
-            folder, payload, duplicate = archive_paper(
+            folder, payload, duplicate, changed_fields = archive_paper(
                 item.pdf_path,
                 self.archive_root(),
                 item.metadata,
@@ -1207,6 +1407,7 @@ class MainWindow(QMainWindow):
         item.folder = folder
         item.json_payload = payload
         item.duplicate = duplicate
+        item.changed_fields = changed_fields
         item.note = stringify(payload.get("manual_notes")) or item.note
         if duplicate:
             message = f"检测到重复论文，未新增归档，已读取旧记录和人工笔记：\n{folder}"
@@ -1269,6 +1470,8 @@ class MainWindow(QMainWindow):
         payload = dict(payload)
         payload["manual_notes"] = item.note
         payload["model_prompt"] = item.prompt
+        if item.changed_fields:
+            payload["updated_fields"] = sorted(item.changed_fields)
         self.json_preview.setPlainText(json.dumps(payload, ensure_ascii=False, indent=2))
 
     def show_current_prompt(self) -> None:
