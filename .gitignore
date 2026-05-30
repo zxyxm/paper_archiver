@@ -11,6 +11,7 @@ ENV/
 .env
 .env.*
 !.env.example
+config.json
 
 .vscode/
 .idea/
