@@ -3,17 +3,15 @@ import os
 import re
 import shutil
 import sys
-import webbrowser
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
 import requests
-from PyQt5.QtCore import QThread, Qt, pyqtSignal
-from PyQt5.QtGui import QDragEnterEvent, QDropEvent
+from PyQt5.QtCore import QThread, Qt, QUrl, pyqtSignal
+from PyQt5.QtGui import QDesktopServices, QDragEnterEvent, QDropEvent
 from PyQt5.QtWidgets import (
     QApplication,
     QComboBox,
-    QDialog,
     QFileDialog,
     QFormLayout,
     QGridLayout,
@@ -24,7 +22,6 @@ from PyQt5.QtWidgets import (
     QMainWindow,
     QMessageBox,
     QPushButton,
-    QPlainTextEdit,
     QProgressBar,
     QTextEdit,
     QVBoxLayout,
@@ -39,7 +36,6 @@ except ImportError:  # pragma: no cover - shown in UI at runtime
 
 APP_DIR = Path(__file__).resolve().parent
 DEFAULT_ARCHIVE_ROOT = APP_DIR / "archive"
-DEEPSEEK_WEB_URL = "https://chat.deepseek.com/"
 
 PROVIDER_PRESETS = {
     "deepseek": {
@@ -63,7 +59,7 @@ PROVIDER_PRESETS = {
         "auth_header": os.environ.get("XIAOMI_AUTH_HEADER", "api-key"),
     },
     "custom": {
-        "name": "自定义 OpenAI兼容",
+        "name": "自定义 OpenAI 兼容",
         "base_url": os.environ.get("OPENAI_COMPAT_BASE_URL", ""),
         "model": os.environ.get("OPENAI_COMPAT_MODEL", ""),
         "api_key_env": "OPENAI_COMPAT_API_KEY",
@@ -78,8 +74,14 @@ PROVIDER_PRESETS = {
 class PaperMetadata:
     title: str = ""
     authors: str = ""
+    first_author: str = ""
+    last_author: str = ""
+    corresponding_author_affiliation: str = ""
     publisher: str = ""
     published_time: str = ""
+    abstract_zh: str = ""
+    abstract_en: str = ""
+    plain_language_summary: str = ""
 
 
 @dataclass
@@ -103,18 +105,35 @@ def clean_json_text(text: str) -> str:
     return text
 
 
+def stringify(value: object) -> str:
+    if isinstance(value, list):
+        return ", ".join(str(item).strip() for item in value if str(item).strip())
+    return str(value or "").strip()
+
+
 def parse_metadata_json(text: str) -> PaperMetadata:
     data = json.loads(clean_json_text(text))
-    authors = data.get("authors", "")
-    if isinstance(authors, list):
-        authors = ", ".join(str(item).strip() for item in authors if str(item).strip())
     return PaperMetadata(
-        title=str(data.get("title", "")).strip(),
-        authors=str(authors).strip(),
-        publisher=str(data.get("publisher", "")).strip(),
-        published_time=str(
-            data.get("published_time", data.get("publication_time", ""))
-        ).strip(),
+        title=stringify(data.get("title")),
+        authors=stringify(data.get("authors")),
+        first_author=stringify(data.get("first_author")),
+        last_author=stringify(data.get("last_author")),
+        corresponding_author_affiliation=stringify(
+            data.get("corresponding_author_affiliation")
+            or data.get("corresponding_affiliation")
+            or data.get("last_author_affiliation")
+        ),
+        publisher=stringify(data.get("publisher")),
+        published_time=stringify(
+            data.get("published_time") or data.get("publication_time")
+        ),
+        abstract_zh=stringify(data.get("abstract_zh") or data.get("chinese_abstract")),
+        abstract_en=stringify(data.get("abstract_en") or data.get("english_abstract")),
+        plain_language_summary=stringify(
+            data.get("plain_language_summary")
+            or data.get("plain_summary")
+            or data.get("summary_for_layperson")
+        ),
     )
 
 
@@ -124,7 +143,7 @@ def compact_text(value: str, fallback: str = "untitled", max_len: int = 80) -> s
     return (value[:max_len].strip(" ._") or fallback)[:max_len]
 
 
-def extract_pdf_text(pdf_path: Path, pages: int = 3) -> str:
+def extract_pdf_text(pdf_path: Path, pages: int = 8) -> str:
     if fitz is None:
         raise RuntimeError("缺少 PyMuPDF，请先安装：pip install PyMuPDF")
 
@@ -135,15 +154,25 @@ def extract_pdf_text(pdf_path: Path, pages: int = 3) -> str:
     text = "\n".join(chunks).strip()
     if not text:
         raise RuntimeError("未能从 PDF 提取文字，可能是扫描版论文。")
-    return text[:12000]
+    return text[:30000]
 
 
 def build_prompt(pdf_text: str) -> str:
     return (
-        "请从下面论文首页/前几页文字中识别论文信息，只返回 JSON，不要解释。\n"
-        "字段必须为：title, authors, publisher, published_time。\n"
-        "authors 可以是字符串或字符串数组；publisher 指期刊/会议/出版社；"
-        "published_time 使用原文可确认的年份或完整日期，无法确认则留空。\n\n"
+        "请从下面论文 PDF 的首页和前几页文字中识别论文信息，并只返回严格 JSON，"
+        "不要解释，不要输出 Markdown。\n"
+        "必须返回这些字段：\n"
+        "- title: 论文题目。\n"
+        "- authors: 全部作者，字符串数组或用逗号分隔的字符串。\n"
+        "- first_author: 第一作者姓名。\n"
+        "- last_author: 最后一个作者姓名；如果最后一个作者不是通讯作者，也按最后作者填写。\n"
+        "- corresponding_author_affiliation: 通讯作者单位；如果只能识别最后作者单位，填写最后作者单位；无法确认则留空。\n"
+        "- publisher: 期刊/会议/出版社。\n"
+        "- published_time: 原文可确认的年份或完整日期，无法确认则留空。\n"
+        "- abstract_zh: 中文摘要，概括研究目的、方法、主要发现和意义。\n"
+        "- abstract_en: English abstract summarizing objective, methods, findings and significance.\n"
+        "- plain_language_summary: 用大白话中文说明这篇论文全文主要做了什么，尽量让非专业读者也能看懂。\n\n"
+        "如果字段无法从文本中确认，请使用空字符串，不要编造。\n\n"
         f"论文文本：\n{pdf_text}"
     )
 
@@ -158,35 +187,33 @@ def call_openai_compatible_api(prompt: str, config: ApiConfig) -> PaperMetadata:
         raise RuntimeError("缺少 API Key。")
 
     auth_header = config.auth_header.strip() or "Authorization"
-    if auth_header.lower() == "authorization":
-        auth_value = f"Bearer {config.api_key}"
-    else:
-        auth_value = config.api_key
-
-    headers = {
-        auth_header: auth_value,
-        "Content-Type": "application/json",
-    }
+    auth_value = f"Bearer {config.api_key}" if auth_header.lower() == "authorization" else config.api_key
+    headers = {auth_header: auth_value, "Content-Type": "application/json"}
     payload = {
         "model": config.model,
         "messages": [
             {
                 "role": "system",
-                "content": "你是论文元数据抽取助手，只输出严格 JSON。",
+                "content": "你是论文元数据和摘要抽取助手，只输出严格 JSON。",
             },
             {"role": "user", "content": prompt},
         ],
         "temperature": 0.0,
-        "max_completion_tokens": 1024,
+        "max_completion_tokens": 2048,
         "response_format": {"type": "json_object"},
     }
-    response = requests.post(base_url, headers=headers, json=payload, timeout=90)
+    response = requests.post(base_url, headers=headers, json=payload, timeout=120)
     if response.status_code == 400 and "response_format" in response.text:
         payload.pop("response_format", None)
-        response = requests.post(base_url, headers=headers, json=payload, timeout=90)
-    response.raise_for_status()
-    payload = response.json()
-    message = payload["choices"][0]["message"]
+        response = requests.post(base_url, headers=headers, json=payload, timeout=120)
+    if response.status_code == 400 and "max_completion_tokens" in response.text:
+        payload["max_tokens"] = payload.pop("max_completion_tokens")
+        response = requests.post(base_url, headers=headers, json=payload, timeout=120)
+    if response.status_code >= 400:
+        raise RuntimeError(format_api_error(response))
+
+    api_payload = response.json()
+    message = api_payload["choices"][0]["message"]
     content = message.get("content") or message.get("reasoning_content") or ""
     return parse_metadata_json(content)
 
@@ -201,17 +228,10 @@ def validate_openai_compatible_api(config: ApiConfig) -> str:
         raise RuntimeError("缺少 API Key。")
 
     auth_header = config.auth_header.strip() or "Authorization"
-    if auth_header.lower() == "authorization":
-        auth_value = f"Bearer {config.api_key}"
-    else:
-        auth_value = config.api_key
-
+    auth_value = f"Bearer {config.api_key}" if auth_header.lower() == "authorization" else config.api_key
     response = requests.post(
         base_url,
-        headers={
-            auth_header: auth_value,
-            "Content-Type": "application/json",
-        },
+        headers={auth_header: auth_value, "Content-Type": "application/json"},
         json={
             "model": config.model,
             "messages": [{"role": "user", "content": "请只回复 OK。"}],
@@ -220,6 +240,18 @@ def validate_openai_compatible_api(config: ApiConfig) -> str:
         },
         timeout=30,
     )
+    if response.status_code == 400 and "max_completion_tokens" in response.text:
+        response = requests.post(
+            base_url,
+            headers={auth_header: auth_value, "Content-Type": "application/json"},
+            json={
+                "model": config.model,
+                "messages": [{"role": "user", "content": "请只回复 OK。"}],
+                "temperature": 0.0,
+                "max_tokens": 16,
+            },
+            timeout=30,
+        )
     if response.status_code >= 400:
         raise RuntimeError(format_api_error(response))
     payload = response.json()
@@ -268,7 +300,8 @@ def archive_paper(pdf_path: Path, root_dir: Path, metadata: PaperMetadata) -> Pa
     root_dir.mkdir(parents=True, exist_ok=True)
 
     title = compact_text(metadata.title, pdf_path.stem, 72)
-    first_author = compact_text(metadata.authors.split(",")[0], "unknown-author", 32)
+    first_author_source = metadata.first_author or metadata.authors.split(",")[0]
+    first_author = compact_text(first_author_source, "unknown-author", 32)
     year_match = re.search(r"(19|20)\d{2}", metadata.published_time)
     year = year_match.group(0) if year_match else "unknown-year"
     folder_name = compact_text(f"{year} {first_author} {title}", pdf_path.stem, 118)
@@ -361,40 +394,11 @@ class DropArea(QLabel):
                 return
 
 
-class JsonPasteDialog(QDialog):
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.setWindowTitle("粘贴模型返回 JSON")
-        self.resize(620, 420)
-        layout = QVBoxLayout(self)
-        layout.addWidget(
-            QLabel("请粘贴模型返回的 JSON，字段：title, authors, publisher, published_time")
-        )
-        self.editor = QPlainTextEdit()
-        self.editor.setPlaceholderText(
-            '{\n  "title": "...",\n  "authors": ["..."],\n'
-            '  "publisher": "...",\n  "published_time": "..."\n}'
-        )
-        layout.addWidget(self.editor)
-        row = QHBoxLayout()
-        cancel = QPushButton("取消")
-        ok = QPushButton("读取 JSON")
-        cancel.clicked.connect(self.reject)
-        ok.clicked.connect(self.accept)
-        row.addStretch()
-        row.addWidget(cancel)
-        row.addWidget(ok)
-        layout.addLayout(row)
-
-    def text(self) -> str:
-        return self.editor.toPlainText()
-
-
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("论文识别归档软件")
-        self.resize(980, 760)
+        self.resize(1040, 860)
         self.pdf_path: Path | None = None
         self.worker: ParseWorker | None = None
         self.validate_worker: ValidateWorker | None = None
@@ -410,15 +414,12 @@ class MainWindow(QMainWindow):
 
         controls = QHBoxLayout()
         self.import_button = QPushButton("导入 PDF")
-        self.parse_button = QPushButton("导入解析")
-        self.web_button = QPushButton("打开 DeepSeek 网页")
-        self.paste_button = QPushButton("粘贴 JSON 结果")
+        self.parse_button = QPushButton("大模型解析")
         self.archive_button = QPushButton("归档到 archive")
         controls.addWidget(self.import_button)
         controls.addWidget(self.parse_button)
-        controls.addWidget(self.web_button)
-        controls.addWidget(self.paste_button)
         controls.addWidget(self.archive_button)
+        controls.addStretch()
         root.addLayout(controls)
 
         self.status = QLabel("请选择或拖入一篇 PDF。")
@@ -428,7 +429,7 @@ class MainWindow(QMainWindow):
         root.addWidget(self.status)
         root.addWidget(self.progress)
 
-        api_box = QGroupBox("模型 API")
+        api_box = QGroupBox("大模型 API")
         api_layout = QGridLayout(api_box)
         self.provider_combo = QComboBox()
         for key, preset in PROVIDER_PRESETS.items():
@@ -456,26 +457,53 @@ class MainWindow(QMainWindow):
         archive_layout = QHBoxLayout(archive_box)
         self.archive_root_edit = QLineEdit(str(DEFAULT_ARCHIVE_ROOT))
         self.choose_archive_button = QPushButton("选择目录")
+        self.open_archive_button = QPushButton("打开目录")
         archive_layout.addWidget(self.archive_root_edit)
         archive_layout.addWidget(self.choose_archive_button)
+        archive_layout.addWidget(self.open_archive_button)
         root.addWidget(archive_box)
 
-        fields_box = QGroupBox("论文参数")
+        fields_box = QGroupBox("论文信息")
         form = QFormLayout(fields_box)
         self.title_edit = QLineEdit()
         self.authors_edit = QLineEdit()
+        self.first_author_edit = QLineEdit()
+        self.last_author_edit = QLineEdit()
+        self.corresponding_affiliation_edit = QLineEdit()
         self.publisher_edit = QLineEdit()
         self.time_edit = QLineEdit()
         form.addRow("题目", self.title_edit)
         form.addRow("作者", self.authors_edit)
+        form.addRow("第一作者", self.first_author_edit)
+        form.addRow("最后作者", self.last_author_edit)
+        form.addRow("通讯作者单位", self.corresponding_affiliation_edit)
         form.addRow("出版社/期刊/会议", self.publisher_edit)
         form.addRow("发表时间", self.time_edit)
         root.addWidget(fields_box)
 
+        summary_box = QGroupBox("摘要与大白话说明")
+        summary_layout = QGridLayout(summary_box)
+        self.abstract_zh_edit = QTextEdit()
+        self.abstract_en_edit = QTextEdit()
+        self.plain_summary_edit = QTextEdit()
+        for editor in (
+            self.abstract_zh_edit,
+            self.abstract_en_edit,
+            self.plain_summary_edit,
+        ):
+            editor.setMinimumHeight(110)
+        summary_layout.addWidget(QLabel("中文摘要"), 0, 0)
+        summary_layout.addWidget(QLabel("English Abstract"), 0, 1)
+        summary_layout.addWidget(self.abstract_zh_edit, 1, 0)
+        summary_layout.addWidget(self.abstract_en_edit, 1, 1)
+        summary_layout.addWidget(QLabel("大白话版全文内容"), 2, 0, 1, 2)
+        summary_layout.addWidget(self.plain_summary_edit, 3, 0, 1, 2)
+        root.addWidget(summary_box)
+
         bottom = QGridLayout()
         self.prompt_preview = QTextEdit()
         self.prompt_preview.setReadOnly(True)
-        self.prompt_preview.setPlaceholderText("解析后这里会显示发送给模型的提示词。")
+        self.prompt_preview.setPlaceholderText("解析时发送给大模型的提示词会显示在这里。")
         self.log = QTextEdit()
         self.log.setReadOnly(True)
         self.log.setPlaceholderText("操作日志")
@@ -487,10 +515,9 @@ class MainWindow(QMainWindow):
 
         self.import_button.clicked.connect(self.choose_pdf)
         self.parse_button.clicked.connect(self.parse_pdf)
-        self.web_button.clicked.connect(self.open_deepseek_web)
-        self.paste_button.clicked.connect(self.paste_json)
         self.archive_button.clicked.connect(self.archive_current)
         self.choose_archive_button.clicked.connect(self.choose_archive_root)
+        self.open_archive_button.clicked.connect(self.open_archive_root)
         self.validate_key_button.clicked.connect(self.validate_api_key)
         self.provider_combo.currentIndexChanged.connect(self.apply_provider_preset)
         self.apply_provider_preset()
@@ -512,7 +539,7 @@ class MainWindow(QMainWindow):
                 margin-top: 12px;
                 padding-top: 16px;
             }
-            QLineEdit, QTextEdit, QPlainTextEdit, QComboBox {
+            QLineEdit, QTextEdit, QComboBox {
                 border: 1px solid #cbd5e1;
                 border-radius: 6px;
                 padding: 6px;
@@ -586,6 +613,7 @@ class MainWindow(QMainWindow):
 
     def set_pdf(self, path: str) -> None:
         self.pdf_path = Path(path)
+        self.prompt_text = ""
         self.status.setText(f"当前 PDF：{self.pdf_path}")
         self.drop_area.setText(self.pdf_path.name)
         self.log_message(f"已导入：{self.pdf_path}")
@@ -597,13 +625,21 @@ class MainWindow(QMainWindow):
         if folder:
             self.archive_root_edit.setText(folder)
 
+    def open_archive_root(self) -> None:
+        root = Path(self.archive_root_edit.text().strip() or DEFAULT_ARCHIVE_ROOT)
+        root.mkdir(parents=True, exist_ok=True)
+        QDesktopServices.openUrl(QUrl.fromLocalFile(str(root.resolve())))
+        self.log_message(f"已打开归档目录：{root}")
+
     def parse_pdf(self) -> None:
         if not self.pdf_path:
             QMessageBox.warning(self, "缺少 PDF", "请先导入或拖入 PDF。")
             return
         self.progress.setRange(0, 0)
         config = self.current_api_config()
-        self.status.setText(f"正在提取 PDF 文本并调用 {PROVIDER_PRESETS[config.provider]['name']}...")
+        self.status.setText(
+            f"正在提取 PDF 文本并调用 {PROVIDER_PRESETS[config.provider]['name']}..."
+        )
         self.worker = ParseWorker(self.pdf_path, config)
         self.worker.promptReady.connect(self.on_prompt_ready)
         self.worker.finished.connect(self.on_parse_finished)
@@ -619,67 +655,46 @@ class MainWindow(QMainWindow):
         self.progress.setValue(1)
         self.apply_metadata(metadata)
         self.status.setText("解析完成，可检查字段后归档。")
-        self.log_message("模型 API 解析完成。")
+        self.log_message("大模型解析完成。")
 
     def on_parse_failed(self, reason: str) -> None:
         self.progress.setRange(0, 1)
         self.progress.setValue(0)
-        try:
-            if not self.prompt_text:
-                self.prompt_text = build_prompt(extract_pdf_text(self.pdf_path))
-                self.prompt_preview.setPlainText(self.prompt_text)
-            QApplication.clipboard().setText(self.prompt_text)
-        except Exception as exc:
-            QMessageBox.critical(self, "解析失败", f"{reason}\n\n同时无法提取提示词：{exc}")
-            return
-        self.status.setText("API 调用失败，已复制提示词，可改用网页或粘贴 JSON。")
-        self.log_message(f"API 解析未完成：{reason}")
-        QMessageBox.warning(
+        self.status.setText("大模型 API 解析失败，请检查 API 配置后重试。")
+        self.log_message(f"大模型解析失败：{reason}")
+        QMessageBox.critical(
             self,
-            "API 调用失败",
-            "已将识别提示词复制到剪贴板。\n"
-            "可检查 API Key/API 地址/模型名，或打开网页手动获取 JSON 后粘贴回来。",
+            "解析失败",
+            "大模型 API 调用失败，请检查 API Key、API 地址、模型名或认证头。\n\n"
+            f"{reason}",
         )
-
-    def open_deepseek_web(self) -> None:
-        if self.pdf_path and not self.prompt_text:
-            try:
-                self.prompt_text = build_prompt(extract_pdf_text(self.pdf_path))
-                self.prompt_preview.setPlainText(self.prompt_text)
-            except Exception as exc:
-                self.log_message(f"提示词生成失败：{exc}")
-        if self.prompt_text:
-            QApplication.clipboard().setText(self.prompt_text)
-            self.log_message("已复制模型提示词到剪贴板。")
-        webbrowser.open(DEEPSEEK_WEB_URL)
-
-    def paste_json(self) -> None:
-        dialog = JsonPasteDialog(self)
-        clipboard_text = QApplication.clipboard().text()
-        if clipboard_text.strip():
-            dialog.editor.setPlainText(clipboard_text)
-        if dialog.exec_() == QDialog.Accepted:
-            try:
-                metadata = parse_metadata_json(dialog.text())
-            except Exception as exc:
-                QMessageBox.critical(self, "JSON 读取失败", str(exc))
-                return
-            self.apply_metadata(metadata)
-            self.status.setText("JSON 已读取，可检查字段后归档。")
-            self.log_message("已从粘贴 JSON 读取论文参数。")
 
     def apply_metadata(self, metadata: PaperMetadata) -> None:
         self.title_edit.setText(metadata.title)
         self.authors_edit.setText(metadata.authors)
+        self.first_author_edit.setText(metadata.first_author)
+        self.last_author_edit.setText(metadata.last_author)
+        self.corresponding_affiliation_edit.setText(
+            metadata.corresponding_author_affiliation
+        )
         self.publisher_edit.setText(metadata.publisher)
         self.time_edit.setText(metadata.published_time)
+        self.abstract_zh_edit.setPlainText(metadata.abstract_zh)
+        self.abstract_en_edit.setPlainText(metadata.abstract_en)
+        self.plain_summary_edit.setPlainText(metadata.plain_language_summary)
 
     def current_metadata(self) -> PaperMetadata:
         return PaperMetadata(
             title=self.title_edit.text().strip(),
             authors=self.authors_edit.text().strip(),
+            first_author=self.first_author_edit.text().strip(),
+            last_author=self.last_author_edit.text().strip(),
+            corresponding_author_affiliation=self.corresponding_affiliation_edit.text().strip(),
             publisher=self.publisher_edit.text().strip(),
             published_time=self.time_edit.text().strip(),
+            abstract_zh=self.abstract_zh_edit.toPlainText().strip(),
+            abstract_en=self.abstract_en_edit.toPlainText().strip(),
+            plain_language_summary=self.plain_summary_edit.toPlainText().strip(),
         )
 
     def archive_current(self) -> None:
@@ -698,7 +713,9 @@ class MainWindow(QMainWindow):
             return
         self.status.setText(f"归档完成：{folder}")
         self.log_message(f"已归档到：{folder}")
-        QMessageBox.information(self, "归档完成", f"PDF 和 metadata.json 已保存到：\n{folder}")
+        QMessageBox.information(
+            self, "归档完成", f"PDF 和 metadata.json 已保存到：\n{folder}"
+        )
 
 
 def main() -> int:

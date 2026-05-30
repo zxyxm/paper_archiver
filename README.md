@@ -1,6 +1,6 @@
 # 论文识别归档软件
 
-Python + PyQt5 写的论文 PDF 识别归档工具。支持拖入 PDF，点击“导入解析”后识别题目、作者、出版社/期刊/会议、发表时间，并把 PDF 与 `metadata.json` 存入默认 `archive` 文件夹。
+Python + PyQt5 写的论文 PDF 识别归档工具。支持拖入 PDF，点击“大模型解析”后识别题目、作者、第一作者、最后作者、通讯作者单位、出版社/期刊/会议、发表时间，并生成中文摘要、English Abstract 和大白话版全文内容说明。归档时会把 PDF 与 `metadata.json` 存入默认 `archive` 文件夹。
 
 ## 环境
 
@@ -28,17 +28,17 @@ pip install -r requirements.txt
 C:\ProgramData\anaconda3\Scripts\conda.exe run -n lwenv python paper_archiver.py
 ```
 
-## 模型 API
+## 大模型 API
 
 软件内有三种服务选项：
 
 - `DeepSeek API`
 - `小米 MiMo Reasoning`
-- `自定义 OpenAI兼容`
+- `自定义 OpenAI 兼容`
 
 填写 API 地址、模型、API Key 和认证头后，可以先点“验证 API Key”。软件会发送一个很小的测试请求，用来确认 Key、Base URL、模型名和认证头是否匹配。
 
-### DeepSeek
+### DeepSeek API
 
 ```powershell
 $env:DEEPSEEK_API_KEY="你的 DeepSeek API Key"
@@ -54,12 +54,12 @@ https://api.deepseek.com/chat/completions
 
 ### 小米 MiMo
 
-软件已按你给的参数设置默认值：
+默认参数：
 
 ```text
 模型：mimo-v2.5-pro
-Provider：custom:xiaomi-mimo-reasoning
 Base URL：https://token-plan-cn.xiaomimimo.com/v1
+认证头：api-key
 ```
 
 配置 API Key 后运行：
@@ -74,24 +74,28 @@ $env:XIAOMI_AUTH_HEADER="api-key"
 
 程序会自动把 `/v1` 基础地址补成 `/v1/chat/completions`。如果你的接口要求 `Authorization: Bearer ...`，可以在界面里把“认证头”改成 `Authorization`。
 
-### 网页兜底
+## 解析字段
 
-API 调用失败或没有 API Key 时，可以点击“打开 DeepSeek 网页”。软件会把识别提示词复制到剪贴板。你在网页中获得 JSON 后，回到软件点击“粘贴 JSON 结果”。
-
-要求模型返回的 JSON 格式：
+模型返回并写入 `metadata.json` 的主要字段：
 
 ```json
 {
   "title": "论文题目",
   "authors": ["作者1", "作者2"],
+  "first_author": "第一作者",
+  "last_author": "最后作者",
+  "corresponding_author_affiliation": "通讯作者单位",
   "publisher": "期刊/会议/出版社",
-  "published_time": "发表时间"
+  "published_time": "发表时间",
+  "abstract_zh": "中文摘要",
+  "abstract_en": "English abstract",
+  "plain_language_summary": "大白话版全文内容说明"
 }
 ```
 
 ## 归档结果
 
-点击“归档到 archive”会默认保存到项目目录下的 `archive` 文件夹，也可以在界面中选择其他归档目录。
+点击“归档到 archive”会默认保存到项目目录下的 `archive` 文件夹，也可以在界面中选择其他归档目录。点击“打开目录”可以直接打开当前归档目录。
 
 ```text
 archive/
