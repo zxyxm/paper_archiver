@@ -1,0 +1,10 @@
+name: lwenv
+channels:
+  - conda-forge
+dependencies:
+  - python=3.11
+  - pip
+  - pyqt=5
+  - pip:
+      - PyMuPDF>=1.24
+      - requests>=2.31
