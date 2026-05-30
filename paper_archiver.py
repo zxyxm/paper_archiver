@@ -372,22 +372,12 @@ def iter_archive_payloads(root_dir: Path):
             continue
 
 
-def find_duplicate(root_dir: Path, paper_hash: str, metadata: PaperMetadata | None = None):
+def find_duplicate(root_dir: Path, metadata: PaperMetadata | None = None):
     wanted_title = normalized_title(metadata.title if metadata else "")
     wanted_title_zh = normalized_title(metadata.title_zh if metadata else "")
+    if not (wanted_title or wanted_title_zh):
+        return None, None
     for folder, payload in iter_archive_payloads(root_dir):
-        if paper_hash and payload.get("paper_hash") == paper_hash:
-            return folder, payload
-        for key in ("source_pdf", "original_pdf"):
-            archived_pdf = Path(stringify(payload.get(key)))
-            if paper_hash and archived_pdf.exists():
-                try:
-                    if pdf_hash(archived_pdf) == paper_hash:
-                        payload["paper_hash"] = paper_hash
-                        write_metadata_file(folder, payload)
-                        return folder, payload
-                except OSError:
-                    pass
         payload_titles = {
             normalized_title(stringify(payload.get("title"))),
             normalized_title(stringify(payload.get("title_zh"))),
@@ -408,7 +398,7 @@ def archive_paper(
 ) -> tuple[Path, dict, bool]:
     root_dir.mkdir(parents=True, exist_ok=True)
     paper_hash = pdf_hash(pdf_path)
-    duplicate_folder, duplicate_payload = find_duplicate(root_dir, paper_hash, metadata)
+    duplicate_folder, duplicate_payload = find_duplicate(root_dir, metadata)
     if duplicate_folder and duplicate_payload:
         return duplicate_folder, duplicate_payload, True
 
@@ -625,24 +615,21 @@ class ParseWorker(QThread):
         total = len(self.pdf_paths)
         for index, pdf_path in enumerate(self.pdf_paths, start=1):
             try:
-                paper_hash = pdf_hash(pdf_path)
-                folder, payload = find_duplicate(self.archive_root, paper_hash)
-                if folder and payload:
-                    item = PaperItem(
-                        pdf_path=pdf_path,
-                        metadata=metadata_from_dict(payload),
-                        prompt=stringify(payload.get("model_prompt")),
-                        folder=folder,
-                        duplicate=True,
-                        json_payload=payload,
-                        note=stringify(payload.get("manual_notes")),
-                    )
-                    self.itemFinished.emit(index, total, item)
-                    continue
                 text = extract_pdf_text(pdf_path)
                 prompt = build_prompt(text)
                 metadata = call_openai_compatible_api(prompt, self.config)
-                item = PaperItem(pdf_path=pdf_path, metadata=metadata, prompt=prompt)
+                folder, payload, duplicate = archive_paper(
+                    pdf_path, self.archive_root, metadata, prompt
+                )
+                item = PaperItem(
+                    pdf_path=pdf_path,
+                    metadata=metadata_from_dict(payload),
+                    prompt=stringify(payload.get("model_prompt")) or prompt,
+                    folder=folder,
+                    duplicate=duplicate,
+                    json_payload=payload,
+                    note=stringify(payload.get("manual_notes")),
+                )
                 self.itemFinished.emit(index, total, item)
             except Exception as exc:
                 self.failed.emit(index, total, str(pdf_path), str(exc))
@@ -768,12 +755,10 @@ class MainWindow(QMainWindow):
         self.import_button = QPushButton("导入 PDF")
         self.batch_import_button = QPushButton("批量导入 PDF")
         self.parse_button = QPushButton("大模型解析")
-        self.archive_button = QPushButton("归档当前")
         self.scholar_button = QPushButton("Google Scholar 主页")
         controls.addWidget(self.import_button)
         controls.addWidget(self.batch_import_button)
         controls.addWidget(self.parse_button)
-        controls.addWidget(self.archive_button)
         controls.addWidget(self.scholar_button)
         controls.addStretch()
         root.addLayout(controls)
@@ -811,6 +796,12 @@ class MainWindow(QMainWindow):
         self.auth_header_edit = QLineEdit()
         self.validate_key_button = QPushButton("验证 API Key")
         self.save_key_button = QPushButton("保存 API Key")
+        self.validate_key_button.setFixedWidth(110)
+        self.save_key_button.setFixedWidth(110)
+        api_buttons = QHBoxLayout()
+        api_buttons.addWidget(self.validate_key_button)
+        api_buttons.addWidget(self.save_key_button)
+        api_buttons.addStretch()
         api_layout.addWidget(QLabel("服务"), 0, 0)
         api_layout.addWidget(self.provider_combo, 0, 1)
         api_layout.addWidget(QLabel("API 地址"), 0, 2)
@@ -821,8 +812,7 @@ class MainWindow(QMainWindow):
         api_layout.addWidget(self.api_key_edit, 1, 3)
         api_layout.addWidget(QLabel("认证头"), 2, 0)
         api_layout.addWidget(self.auth_header_edit, 2, 1)
-        api_layout.addWidget(self.validate_key_button, 2, 2)
-        api_layout.addWidget(self.save_key_button, 2, 3)
+        api_layout.addLayout(api_buttons, 2, 2, 1, 2)
         root.addWidget(api_box)
 
         archive_box = QGroupBox("归档目录")
@@ -929,7 +919,6 @@ class MainWindow(QMainWindow):
         self.import_button.clicked.connect(self.choose_pdf)
         self.batch_import_button.clicked.connect(self.choose_pdfs)
         self.parse_button.clicked.connect(self.parse_pdfs)
-        self.archive_button.clicked.connect(self.archive_current)
         self.choose_archive_button.clicked.connect(self.choose_archive_root)
         self.open_archive_button.clicked.connect(self.open_archive_root)
         self.archive_stats_button.clicked.connect(self.show_archive_stats)
@@ -1052,30 +1041,10 @@ class MainWindow(QMainWindow):
     def set_pdfs(self, paths: list[str]) -> None:
         self.paper_items = [PaperItem(pdf_path=Path(path)) for path in paths]
         self.current_paper_index = 0
-        existing_count = 0
-        for item in self.paper_items:
-            if self.load_existing_for_item(item):
-                existing_count += 1
         self.drop_area.setText(f"已导入 {len(paths)} 个 PDF")
-        notice = f"，其中 {existing_count} 篇已存在" if existing_count else ""
-        self.status.setText(f"已导入 {len(paths)} 个 PDF{notice}，点击“大模型解析”。")
-        self.log_message(f"已导入 PDF 数量：{len(paths)}{notice}")
+        self.status.setText(f"已导入 {len(paths)} 个 PDF，点击“大模型解析”后会自动归档。")
+        self.log_message(f"已导入 PDF 数量：{len(paths)}")
         self.update_current_view()
-
-    def load_existing_for_item(self, item: PaperItem) -> bool:
-        try:
-            folder, payload = find_duplicate(self.archive_root(), pdf_hash(item.pdf_path))
-        except OSError:
-            return False
-        if not folder or not payload:
-            return False
-        item.metadata = metadata_from_dict(payload)
-        item.prompt = stringify(payload.get("model_prompt"))
-        item.folder = folder
-        item.duplicate = True
-        item.json_payload = payload
-        item.note = stringify(payload.get("manual_notes"))
-        return True
 
     def choose_archive_root(self) -> None:
         folder = QFileDialog.getExistingDirectory(
