@@ -1,5 +1,6 @@
 import hashlib
 import json
+import re
 import shutil
 from dataclasses import asdict
 from datetime import datetime
@@ -125,6 +126,18 @@ def merge_metadata_payload(
     changed_fields: set[str] = set()
     for key, new_value in new_values.items():
         old_value = old_values.get(key)
+        if key == "tags":
+            merged_tags: list[str] = []
+            for tag in (old_value or []) + (new_value or []):
+                if tag and tag not in merged_tags:
+                    merged_tags.append(tag)
+            if new_value:
+                merged[key] = merged_tags
+                if merged_tags != old_value:
+                    changed_fields.add(key)
+            else:
+                merged[key] = old_value or payload.get(key, [])
+            continue
         if isinstance(new_value, bool):
             if new_value != old_value:
                 merged[key] = new_value

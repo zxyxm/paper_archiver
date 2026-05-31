@@ -4,6 +4,21 @@ from .models import PaperMetadata
 from .utils import boolify, clean_json_text, stringify
 
 
+def tags_from_value(value: object) -> list[str]:
+    if isinstance(value, list):
+        raw_tags = value
+    else:
+        raw_tags = str(value or "").replace("，", ",").replace("、", ",").split(",")
+    tags: list[str] = []
+    seen: set[str] = set()
+    for raw_tag in raw_tags:
+        tag = str(raw_tag).strip()
+        if tag and tag not in seen:
+            tags.append(tag)
+            seen.add(tag)
+    return tags
+
+
 def metadata_from_dict(data: dict) -> PaperMetadata:
     if not isinstance(data, dict):
         data = {}
@@ -42,6 +57,7 @@ def metadata_from_dict(data: dict) -> PaperMetadata:
             or data.get("plain_summary")
             or data.get("summary_for_layperson")
         ),
+        tags=tags_from_value(data.get("tags") or data.get("labels")),
     )
 
 

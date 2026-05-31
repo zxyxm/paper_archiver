@@ -6,17 +6,8 @@ DEFAULT_ARCHIVE_ROOT = APP_DIR / "archive"
 CONFIG_FILE = APP_DIR / "config.json"
 
 PROVIDER_PRESETS = {
-    "deepseek": {
-        "name": "DeepSeek API",
-        "base_url": "https://api.deepseek.com/chat/completions",
-        "model": "deepseek-chat",
-        "api_key_env": "DEEPSEEK_API_KEY",
-        "model_env": "DEEPSEEK_MODEL",
-        "base_url_env": "DEEPSEEK_BASE_URL",
-        "auth_header": "Authorization",
-    },
     "xiaomi": {
-        "name": "?? MiMo Reasoning",
+        "name": "小米 MiMo Reasoning",
         "base_url": os.environ.get(
             "XIAOMI_BASE_URL", "https://token-plan-cn.xiaomimimo.com/v1"
         ),
@@ -26,8 +17,17 @@ PROVIDER_PRESETS = {
         "base_url_env": "XIAOMI_BASE_URL",
         "auth_header": os.environ.get("XIAOMI_AUTH_HEADER", "api-key"),
     },
+    "deepseek": {
+        "name": "DeepSeek API",
+        "base_url": "https://api.deepseek.com/chat/completions",
+        "model": "deepseek-chat",
+        "api_key_env": "DEEPSEEK_API_KEY",
+        "model_env": "DEEPSEEK_MODEL",
+        "base_url_env": "DEEPSEEK_BASE_URL",
+        "auth_header": "Authorization",
+    },
     "custom": {
-        "name": "??? OpenAI ??",
+        "name": "自定义 OpenAI 兼容",
         "base_url": os.environ.get("OPENAI_COMPAT_BASE_URL", ""),
         "model": os.environ.get("OPENAI_COMPAT_MODEL", ""),
         "api_key_env": "OPENAI_COMPAT_API_KEY",

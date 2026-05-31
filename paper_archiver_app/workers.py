@@ -15,11 +15,18 @@ class ParseWorker(QThread):
     failed = pyqtSignal(int, int, str, str)
     finished = pyqtSignal()
 
-    def __init__(self, pdf_paths: list[Path], config: ApiConfig, archive_root: Path):
+    def __init__(
+        self,
+        pdf_paths: list[Path],
+        config: ApiConfig,
+        archive_root: Path,
+        initial_tags_by_path: dict[str, list[str]] | None = None,
+    ):
         super().__init__()
         self.pdf_paths = pdf_paths
         self.config = config
         self.archive_root = archive_root
+        self.initial_tags_by_path = initial_tags_by_path or {}
 
     def run(self) -> None:
         total = len(self.pdf_paths)
@@ -31,6 +38,9 @@ class ParseWorker(QThread):
                 text = extract_pdf_text(pdf_path)
                 prompt = build_prompt(text)
                 metadata = call_openai_compatible_api(prompt, self.config)
+                initial_tags = self.initial_tags_by_path.get(str(pdf_path), [])
+                if initial_tags:
+                    metadata.tags = list(dict.fromkeys(metadata.tags + initial_tags))
                 folder, payload, duplicate, changed_fields = archive_paper(
                     pdf_path, self.archive_root, metadata, prompt
                 )

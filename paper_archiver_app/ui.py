@@ -52,9 +52,10 @@ from .workers import JournalLookupWorker, ParseWorker, ScholarWorker, ValidateWo
 
 class DropArea(QLabel):
     pdfDropped = pyqtSignal(list)
+    folderDropped = pyqtSignal(list)
 
     def __init__(self):
-        super().__init__("拖入一个或多个 PDF 到这里\n或点击“导入 PDF / 批量导入”")
+        super().__init__("拖入一个或多个 PDF 或文件夹到这里\n文件夹名会作为论文标签写入")
         self.setAlignment(Qt.AlignCenter)
         self.setAcceptDrops(True)
         self.setMinimumHeight(110)
@@ -71,19 +72,25 @@ class DropArea(QLabel):
         )
 
     def dragEnterEvent(self, event: QDragEnterEvent) -> None:
-        if any(url.toLocalFile().lower().endswith(".pdf") for url in event.mimeData().urls()):
+        paths = [url.toLocalFile() for url in event.mimeData().urls()]
+        if any(path.lower().endswith(".pdf") or Path(path).is_dir() for path in paths):
             event.acceptProposedAction()
             return
         event.ignore()
 
     def dropEvent(self, event: QDropEvent) -> None:
-        paths = [
+        paths = [url.toLocalFile() for url in event.mimeData().urls()]
+        pdf_paths = [
             url.toLocalFile()
             for url in event.mimeData().urls()
             if url.toLocalFile().lower().endswith(".pdf")
         ]
-        if paths:
-            self.pdfDropped.emit(paths)
+        folder_paths = [path for path in paths if Path(path).is_dir()]
+        if pdf_paths:
+            self.pdfDropped.emit(pdf_paths)
+        if folder_paths:
+            self.folderDropped.emit(folder_paths)
+        if pdf_paths or folder_paths:
             event.acceptProposedAction()
 
 class MainWindow(QMainWindow):
@@ -115,6 +122,7 @@ class MainWindow(QMainWindow):
         settings_layout = QVBoxLayout(settings_tab)
         self.drop_area = DropArea()
         self.drop_area.pdfDropped.connect(self.set_pdfs)
+        self.drop_area.folderDropped.connect(self.handle_dropped_folders)
         root.addWidget(self.drop_area)
         self.pdf_list = QListWidget()
         self.pdf_list.setMaximumHeight(120)
@@ -223,12 +231,16 @@ class MainWindow(QMainWindow):
         self.publisher_edit = QLineEdit()
         self.time_edit = QLineEdit()
         self.save_info_button = QPushButton("保存论文信息")
+        author_role_layout = QHBoxLayout()
+        author_role_layout.addWidget(QLabel("第一作者"))
+        author_role_layout.addWidget(self.first_author_edit, 1)
+        author_role_layout.addWidget(QLabel("通讯作者"))
+        author_role_layout.addWidget(self.corresponding_author_edit, 1)
         form.addRow("原文题目", self.title_edit)
         form.addRow("中文题目", self.title_zh_edit)
         form.addRow("作者", self.authors_edit)
         form.addRow("作者中文", self.authors_zh_edit)
-        form.addRow("第一作者", self.first_author_edit)
-        form.addRow("通讯作者", self.corresponding_author_edit)
+        form.addRow("作者标识", author_role_layout)
         form.addRow("通讯作者单位", self.corresponding_affiliation_edit)
         form.addRow("通讯作者单位中文", self.corresponding_affiliation_zh_edit)
         form.addRow("出版社/期刊/会议", self.publisher_edit)
@@ -242,6 +254,8 @@ class MainWindow(QMainWindow):
         self.abstract_en_edit = QTextEdit()
         self.plain_summary_edit = QTextEdit()
         self.note_edit = QTextEdit()
+        self.tags_edit = QLineEdit()
+        self.tags_edit.setPlaceholderText("输入自定义标签，用逗号分隔，例如 综述, 代谢组, 待精读")
         self.save_note_button = QPushButton("保存人工笔记")
         for editor in (
             self.abstract_zh_edit,
@@ -255,11 +269,13 @@ class MainWindow(QMainWindow):
         self.abstract_tabs.addTab(self.abstract_en_edit, "English Abstract")
         self.abstract_tabs.setCurrentIndex(0)
         summary_layout.addWidget(self.abstract_tabs, 0, 0, 1, 2)
-        summary_layout.addWidget(QLabel("大白话"), 1, 0)
-        summary_layout.addWidget(QLabel("人工笔记"), 1, 1)
-        summary_layout.addWidget(self.plain_summary_edit, 2, 0)
-        summary_layout.addWidget(self.note_edit, 2, 1)
-        summary_layout.addWidget(self.save_note_button, 3, 1)
+        summary_layout.addWidget(QLabel("标签"), 1, 0)
+        summary_layout.addWidget(self.tags_edit, 1, 1)
+        summary_layout.addWidget(QLabel("大白话"), 2, 0)
+        summary_layout.addWidget(QLabel("人工笔记"), 2, 1)
+        summary_layout.addWidget(self.plain_summary_edit, 3, 0)
+        summary_layout.addWidget(self.note_edit, 3, 1)
+        summary_layout.addWidget(self.save_note_button, 4, 1)
         edit_layout.addWidget(summary_box)
         edit_layout.addStretch()
 
@@ -299,19 +315,37 @@ class MainWindow(QMainWindow):
         archive_controls.addStretch()
         journal_layout.addLayout(archive_controls)
 
-        self.archive_papers_table = QTableWidget(0, 5)
+        archive_filter_layout = QHBoxLayout()
+        self.archive_search_edit = QLineEdit()
+        self.archive_search_edit.setPlaceholderText("检索题目、中文题目、作者、期刊、通讯作者单位或标签")
+        self.archive_tag_filter_combo = QComboBox()
+        self.archive_tag_filter_combo.addItem("全部标签", "")
+        self.archive_filter_clear_button = QPushButton("清空筛选")
+        archive_filter_layout.addWidget(QLabel("检索"))
+        archive_filter_layout.addWidget(self.archive_search_edit, 1)
+        archive_filter_layout.addWidget(QLabel("标签"))
+        archive_filter_layout.addWidget(self.archive_tag_filter_combo)
+        archive_filter_layout.addWidget(self.archive_filter_clear_button)
+        journal_layout.addLayout(archive_filter_layout)
+
+        self.archive_papers_table = QTableWidget(0, 8)
         self.archive_papers_table.setHorizontalHeaderLabels(
-            ["期刊", "发表时间", "第一作者", "通讯作者", "题目"]
+            ["期刊", "发表时间", "第一作者", "通讯作者", "通讯作者单位", "题目", "中文题目", "标签"]
         )
         self.archive_papers_table.setEditTriggers(QTableWidget.NoEditTriggers)
         self.archive_papers_table.setSelectionBehavior(QTableWidget.SelectRows)
         self.archive_papers_table.setSelectionMode(QTableWidget.SingleSelection)
         self.archive_papers_table.verticalHeader().setVisible(False)
         self.archive_papers_table.horizontalHeader().setStretchLastSection(True)
+        self.archive_papers_table.setSortingEnabled(True)
         self.archive_papers_table.setColumnWidth(0, 230)
         self.archive_papers_table.setColumnWidth(1, 110)
         self.archive_papers_table.setColumnWidth(2, 160)
         self.archive_papers_table.setColumnWidth(3, 160)
+        self.archive_papers_table.setColumnWidth(4, 260)
+        self.archive_papers_table.setColumnWidth(5, 320)
+        self.archive_papers_table.setColumnWidth(6, 320)
+        self.archive_papers_table.setColumnWidth(7, 180)
         journal_layout.addWidget(self.archive_papers_table)
 
         other_layout = QVBoxLayout(other_tab)
@@ -358,6 +392,9 @@ class MainWindow(QMainWindow):
         self.journal_open_button.clicked.connect(self.open_journal_source)
         self.archive_papers_refresh_button.clicked.connect(self.load_archive_papers_table)
         self.archive_papers_open_button.clicked.connect(self.open_selected_archive_paper)
+        self.archive_search_edit.textChanged.connect(self.load_archive_papers_table)
+        self.archive_tag_filter_combo.currentIndexChanged.connect(self.load_archive_papers_table)
+        self.archive_filter_clear_button.clicked.connect(self.clear_archive_filters)
         self.archive_papers_table.cellDoubleClicked.connect(
             lambda _row, _column: self.open_selected_archive_paper()
         )
@@ -465,8 +502,9 @@ class MainWindow(QMainWindow):
         if paths:
             self.set_pdfs(paths)
 
-    def set_pdfs(self, paths: list[str]) -> None:
+    def set_pdfs(self, paths: list[str], tags_by_path: dict[str, list[str]] | None = None) -> None:
         self.sync_current_from_fields()
+        tags_by_path = tags_by_path or {}
         added_items = []
         seen = {
             str(item.pdf_path.resolve()) if item.pdf_path.exists() else str(item.pdf_path)
@@ -480,7 +518,9 @@ class MainWindow(QMainWindow):
                 skipped_count += 1
                 continue
             seen.add(key)
-            added_items.append(PaperItem(pdf_path=pdf_path))
+            item = PaperItem(pdf_path=pdf_path)
+            item.metadata.tags = tags_by_path.get(str(pdf_path), [])
+            added_items.append(item)
         if not added_items:
             self.status.setText("没有新增 PDF，重复文件已跳过。")
             return
@@ -489,8 +529,15 @@ class MainWindow(QMainWindow):
         self.current_paper_index = first_new_index
         existing_count = 0
         for item in added_items:
+            initial_tags = list(item.metadata.tags)
             if self.load_existing_for_item(item):
                 existing_count += 1
+                item.metadata.tags = self.merge_tags(item.metadata.tags, initial_tags)
+                if initial_tags and item.folder:
+                    payload = item.json_payload or read_metadata_file(item.folder / "metadata.json")
+                    payload.update(asdict(item.metadata))
+                    write_metadata_file(item.folder, payload)
+                    item.json_payload = payload
         self.refresh_pdf_list()
         self.drop_area.setText(f"已导入 {len(self.paper_items)} 个 PDF")
         notice = f"，其中 {existing_count} 篇已读取旧 JSON" if existing_count else ""
@@ -500,6 +547,76 @@ class MainWindow(QMainWindow):
         )
         self.log_message(f"新增 PDF 数量：{len(added_items)}{notice}{skipped}")
         self.update_current_view()
+
+    def handle_dropped_folders(self, paths: list[str]) -> None:
+        updated_json_count = 0
+        unchanged_json_count = 0
+        imported_pdf_count = 0
+        tags_by_pdf: dict[str, list[str]] = {}
+        pdf_paths: list[str] = []
+
+        for folder_text in paths:
+            folder = Path(folder_text)
+            tag = folder.name.strip()
+            if not tag:
+                continue
+            metadata_files = sorted(folder.rglob("metadata.json"))
+            if metadata_files:
+                for metadata_file in metadata_files:
+                    try:
+                        payload = read_metadata_file(metadata_file)
+                    except (OSError, json.JSONDecodeError):
+                        continue
+                    metadata = metadata_from_dict(payload)
+                    if not metadata.is_paper:
+                        continue
+                    new_tags = self.merge_tags(metadata.tags, [tag])
+                    if new_tags == metadata.tags:
+                        unchanged_json_count += 1
+                        continue
+                    payload["tags"] = new_tags
+                    write_metadata_file(metadata_file.parent, payload)
+                    self.update_loaded_item_from_payload(metadata_file.parent, payload)
+                    updated_json_count += 1
+                continue
+
+            for pdf_path in sorted(folder.rglob("*.pdf")):
+                pdf_paths.append(str(pdf_path))
+                tags_by_pdf.setdefault(str(pdf_path), []).append(tag)
+                imported_pdf_count += 1
+
+        if pdf_paths:
+            self.set_pdfs(pdf_paths, tags_by_pdf)
+        if updated_json_count or unchanged_json_count:
+            self.load_archive_papers_table()
+            self.update_current_view()
+
+        message_parts = []
+        if updated_json_count:
+            message_parts.append(f"已给 {updated_json_count} 篇归档论文追加文件夹标签")
+        if unchanged_json_count:
+            message_parts.append(f"{unchanged_json_count} 篇已包含该标签")
+        if imported_pdf_count:
+            message_parts.append(f"已导入 {imported_pdf_count} 个 PDF，并预置文件夹标签")
+        message = "；".join(message_parts) or "没有找到可处理的论文 JSON 或 PDF。"
+        self.status.setText(message)
+        self.log_message(message)
+
+    def merge_tags(self, current_tags: list[str], new_tags: list[str]) -> list[str]:
+        merged: list[str] = []
+        for tag in current_tags + new_tags:
+            clean_tag = str(tag).strip()
+            if clean_tag and clean_tag not in merged:
+                merged.append(clean_tag)
+        return merged
+
+    def update_loaded_item_from_payload(self, folder: Path, payload: dict) -> None:
+        for item in self.paper_items:
+            if item.folder and item.folder.resolve() == folder.resolve():
+                item.metadata = metadata_from_dict(payload)
+                item.json_payload = payload
+                item.note = stringify(payload.get("manual_notes"))
+                break
 
     def refresh_pdf_list(self) -> None:
         self.pdf_list.blockSignals(True)
@@ -630,8 +747,16 @@ class MainWindow(QMainWindow):
         self.status.setText(
             f"正在解析 {len(self.paper_items)} 个 PDF，调用 {PROVIDER_PRESETS[config.provider]['name']}..."
         )
+        initial_tags_by_path = {
+            str(item.pdf_path): item.metadata.tags
+            for item in self.paper_items
+            if item.metadata.tags
+        }
         self.worker = ParseWorker(
-            [item.pdf_path for item in self.paper_items], config, self.archive_root()
+            [item.pdf_path for item in self.paper_items],
+            config,
+            self.archive_root(),
+            initial_tags_by_path,
         )
         self.worker.itemFinished.connect(self.on_item_finished)
         self.worker.failed.connect(self.on_item_failed)
@@ -723,6 +848,7 @@ class MainWindow(QMainWindow):
         self.abstract_en_edit.setPlainText(metadata.abstract_en)
         self.plain_summary_edit.setPlainText(metadata.plain_language_summary)
         self.note_edit.setPlainText(note)
+        self.tags_edit.setText(", ".join(metadata.tags))
         self.highlight_changed_fields(changed_fields or set())
 
     def highlight_changed_fields(self, changed_fields: set[str]) -> None:
@@ -740,6 +866,7 @@ class MainWindow(QMainWindow):
             "abstract_zh": self.abstract_zh_edit,
             "abstract_en": self.abstract_en_edit,
             "plain_language_summary": self.plain_summary_edit,
+            "tags": self.tags_edit,
         }
         for field, widget in widgets.items():
             if field in changed_fields:
@@ -766,7 +893,18 @@ class MainWindow(QMainWindow):
             abstract_zh=self.abstract_zh_edit.toPlainText().strip(),
             abstract_en=self.abstract_en_edit.toPlainText().strip(),
             plain_language_summary=self.plain_summary_edit.toPlainText().strip(),
+            tags=self.current_tags(),
         )
+
+    def current_tags(self) -> list[str]:
+        tags: list[str] = []
+        seen: set[str] = set()
+        for raw_tag in self.tags_edit.text().replace("，", ",").replace("、", ",").split(","):
+            tag = raw_tag.strip()
+            if tag and tag not in seen:
+                tags.append(tag)
+                seen.add(tag)
+        return tags
 
     def sync_current_from_fields(self) -> None:
         item = self.current_item()
@@ -890,24 +1028,83 @@ class MainWindow(QMainWindow):
 
     def load_archive_papers_table(self) -> None:
         rows = archived_paper_rows(self.archive_root())
+        all_tags = sorted({tag for _folder, metadata in rows for tag in metadata.tags})
+        self.update_archive_tag_filter_options(all_tags)
+
+        query = self.archive_search_edit.text().strip().lower()
+        selected_tag = self.archive_tag_filter_combo.currentData() or ""
+        if query or selected_tag:
+            rows = [
+                (folder, metadata)
+                for folder, metadata in rows
+                if self.archive_row_matches(metadata, query, selected_tag)
+            ]
+
+        self.archive_papers_table.setSortingEnabled(False)
         self.archive_papers_table.setRowCount(len(rows))
         for row_index, (folder, metadata) in enumerate(rows):
+            tags_text = ", ".join(metadata.tags)
             values = [
                 metadata.publisher or metadata.publisher_zh,
                 metadata.published_time,
                 metadata.first_author,
                 metadata.corresponding_author,
-                metadata.title or metadata.title_zh,
+                metadata.corresponding_author_affiliation
+                or metadata.corresponding_author_affiliation_zh,
+                metadata.title,
+                metadata.title_zh,
+                tags_text,
             ]
             for column_index, value in enumerate(values):
                 item = QTableWidgetItem(value)
                 item.setToolTip(value)
-                if column_index == 0:
-                    item.setData(Qt.UserRole, str(folder))
+                item.setData(Qt.UserRole, str(folder))
                 self.archive_papers_table.setItem(row_index, column_index, item)
         self.archive_papers_count_label.setText(f"共 {len(rows)} 篇论文")
+        self.archive_papers_table.setSortingEnabled(True)
         self.archive_papers_table.resizeRowsToContents()
         self.log_message(f"已刷新归档论文表格：{len(rows)} 篇")
+
+    def update_archive_tag_filter_options(self, tags: list[str]) -> None:
+        current_tag = self.archive_tag_filter_combo.currentData() or ""
+        self.archive_tag_filter_combo.blockSignals(True)
+        self.archive_tag_filter_combo.clear()
+        self.archive_tag_filter_combo.addItem("全部标签", "")
+        for tag in tags:
+            self.archive_tag_filter_combo.addItem(tag, tag)
+        index = self.archive_tag_filter_combo.findData(current_tag)
+        self.archive_tag_filter_combo.setCurrentIndex(index if index >= 0 else 0)
+        self.archive_tag_filter_combo.blockSignals(False)
+
+    def archive_row_matches(
+        self, metadata: PaperMetadata, query: str, selected_tag: str
+    ) -> bool:
+        if selected_tag and selected_tag not in metadata.tags:
+            return False
+        if not query:
+            return True
+        searchable = " ".join(
+            [
+                metadata.publisher,
+                metadata.publisher_zh,
+                metadata.published_time,
+                metadata.first_author,
+                metadata.corresponding_author,
+                metadata.corresponding_author_affiliation,
+                metadata.corresponding_author_affiliation_zh,
+                metadata.title,
+                metadata.title_zh,
+                metadata.authors,
+                metadata.authors_zh,
+                " ".join(metadata.tags),
+            ]
+        ).lower()
+        return query in searchable
+
+    def clear_archive_filters(self) -> None:
+        self.archive_search_edit.clear()
+        self.archive_tag_filter_combo.setCurrentIndex(0)
+        self.load_archive_papers_table()
 
     def open_selected_archive_paper(self) -> None:
         row = self.archive_papers_table.currentRow()

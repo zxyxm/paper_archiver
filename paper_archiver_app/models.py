@@ -20,6 +20,7 @@ class PaperMetadata:
     abstract_zh: str = ""
     abstract_en: str = ""
     plain_language_summary: str = ""
+    tags: list[str] = field(default_factory=list)
 
 @dataclass
 class ApiConfig:
