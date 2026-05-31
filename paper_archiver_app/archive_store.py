@@ -54,6 +54,24 @@ def archived_paper_rows(root_dir: Path) -> list[tuple[Path, PaperMetadata]]:
     )
     return rows
 
+def metadata_is_complete(metadata: PaperMetadata) -> bool:
+    if not metadata.is_paper:
+        return bool(
+            (metadata.title or metadata.title_zh)
+            and metadata.plain_language_summary
+        )
+    required_groups = [
+        (metadata.title, metadata.title_zh),
+        (metadata.authors, metadata.authors_zh),
+        (metadata.first_author,),
+        (metadata.corresponding_author_affiliation, metadata.corresponding_author_affiliation_zh),
+        (metadata.publisher, metadata.publisher_zh),
+        (metadata.published_time,),
+        (metadata.abstract_zh, metadata.abstract_en),
+        (metadata.plain_language_summary,),
+    ]
+    return all(any(stringify(value) for value in group) for group in required_groups)
+
 def payload_pdf_matches(payload: dict, paper_hash: str = "", pdf_path: Path | None = None) -> bool:
     if paper_hash and payload.get("paper_hash") == paper_hash:
         return True
@@ -236,7 +254,7 @@ def archive_statistics(root_dir: Path) -> dict:
     for folder, payload in iter_archive_payloads(root_dir):
         folders += 1
         jsons += 1
-        pdfs += len(list(folder.glob("*.pdf")))
+        pdfs += len(list(folder.glob("*.pdf"))) + len(list(folder.glob("*.caj")))
         if stringify(payload.get("manual_notes")):
             notes += 1
         if boolify(payload.get("is_paper", True)):

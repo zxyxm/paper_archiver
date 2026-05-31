@@ -22,7 +22,9 @@ from PyQt5.QtWidgets import (
     QPushButton,
     QProgressBar,
     QListWidget,
+    QListWidgetItem,
     QScrollArea,
+    QStackedWidget,
     QTabWidget,
     QTableWidget,
     QTableWidgetItem,
@@ -31,7 +33,7 @@ from PyQt5.QtWidgets import (
     QWidget,
 )
 
-from .api_client import normalize_chat_completions_url
+from .api_client import SUPPORTED_DOCUMENT_SUFFIXES, normalize_chat_completions_url
 from .archive_store import (
     archive_paper,
     archive_statistics,
@@ -55,7 +57,7 @@ class DropArea(QLabel):
     folderDropped = pyqtSignal(list)
 
     def __init__(self):
-        super().__init__("拖入一个或多个 PDF 或文件夹到这里\n文件夹名会作为论文标签写入")
+        super().__init__("拖入一个或多个 PDF/CAJ 或文件夹到这里\n文件夹名会作为论文标签写入")
         self.setAlignment(Qt.AlignCenter)
         self.setAcceptDrops(True)
         self.setMinimumHeight(110)
@@ -73,7 +75,7 @@ class DropArea(QLabel):
 
     def dragEnterEvent(self, event: QDragEnterEvent) -> None:
         paths = [url.toLocalFile() for url in event.mimeData().urls()]
-        if any(path.lower().endswith(".pdf") or Path(path).is_dir() for path in paths):
+        if any(Path(path).suffix.lower() in SUPPORTED_DOCUMENT_SUFFIXES or Path(path).is_dir() for path in paths):
             event.acceptProposedAction()
             return
         event.ignore()
@@ -83,7 +85,7 @@ class DropArea(QLabel):
         pdf_paths = [
             url.toLocalFile()
             for url in event.mimeData().urls()
-            if url.toLocalFile().lower().endswith(".pdf")
+            if Path(url.toLocalFile()).suffix.lower() in SUPPORTED_DOCUMENT_SUFFIXES
         ]
         folder_paths = [path for path in paths if Path(path).is_dir()]
         if pdf_paths:
@@ -107,16 +109,32 @@ class MainWindow(QMainWindow):
         self.journal_worker: JournalLookupWorker | None = None
         self.current_journal_url = ""
 
-        tabs = QTabWidget()
-        self.setCentralWidget(tabs)
+        shell = QWidget()
+        shell_layout = QHBoxLayout(shell)
+        shell_layout.setContentsMargins(0, 0, 0, 0)
+        shell_layout.setSpacing(0)
+        self.setCentralWidget(shell)
+
+        self.nav_list = QListWidget()
+        self.nav_list.setObjectName("navList")
+        self.nav_list.setFixedWidth(168)
+        self.nav_list.addItems(["主页面", "论文检索", "设置", "其他"])
+        self.nav_list.setCurrentRow(0)
+        shell_layout.addWidget(self.nav_list)
+
+        self.pages = QStackedWidget()
+        shell_layout.addWidget(self.pages, 1)
+
         main_tab = QWidget()
         settings_tab = QWidget()
         other_tab = QWidget()
         journal_tab = QWidget()
-        tabs.addTab(main_tab, "主页面")
-        tabs.addTab(settings_tab, "设置")
-        tabs.addTab(journal_tab, "论文检索")
-        tabs.addTab(other_tab, "其他")
+        self.pages.addWidget(main_tab)
+        self.pages.addWidget(journal_tab)
+        self.pages.addWidget(settings_tab)
+        self.pages.addWidget(other_tab)
+        self.nav_list.currentRowChanged.connect(self.pages.setCurrentIndex)
+        self.create_menu_bar()
 
         root = QVBoxLayout(main_tab)
         settings_layout = QVBoxLayout(settings_tab)
@@ -130,10 +148,11 @@ class MainWindow(QMainWindow):
         root.addWidget(self.pdf_list)
 
         controls = QHBoxLayout()
-        self.import_button = QPushButton("导入 PDF")
-        self.batch_import_button = QPushButton("批量导入 PDF")
-        self.remove_pdf_button = QPushButton("删除当前 PDF")
+        self.import_button = QPushButton("导入 PDF/CAJ")
+        self.batch_import_button = QPushButton("批量导入 PDF/CAJ")
+        self.remove_pdf_button = QPushButton("删除当前文件")
         self.parse_button = QPushButton("大模型解析")
+        self.parse_button.setObjectName("parseButton")
         self.scholar_button = QPushButton("Google Scholar 主页")
         controls.addWidget(self.import_button)
         controls.addWidget(self.batch_import_button)
@@ -143,7 +162,7 @@ class MainWindow(QMainWindow):
         controls.addStretch()
         root.addLayout(controls)
 
-        self.status = QLabel("请选择或拖入 PDF。")
+        self.status = QLabel("请选择或拖入 PDF/CAJ。")
         self.progress = QProgressBar()
         self.progress.setRange(0, 1)
         self.progress.setValue(0)
@@ -194,7 +213,6 @@ class MainWindow(QMainWindow):
         api_layout.addWidget(self.auth_header_edit, 2, 1)
         api_layout.addLayout(api_buttons, 2, 2, 1, 2)
         settings_layout.addWidget(api_box)
-        settings_layout.addStretch()
 
         archive_box = QGroupBox("归档目录")
         archive_layout = QHBoxLayout(archive_box)
@@ -208,7 +226,8 @@ class MainWindow(QMainWindow):
         archive_layout.addWidget(self.open_archive_button)
         archive_layout.addWidget(self.open_paper_folder_button)
         archive_layout.addWidget(self.archive_stats_button)
-        root.addWidget(archive_box)
+        settings_layout.addWidget(archive_box)
+        settings_layout.addStretch()
 
         edit_scroll = QScrollArea()
         edit_scroll.setWidgetResizable(True)
@@ -232,19 +251,23 @@ class MainWindow(QMainWindow):
         self.time_edit = QLineEdit()
         self.save_info_button = QPushButton("保存论文信息")
         author_role_layout = QHBoxLayout()
-        author_role_layout.addWidget(QLabel("第一作者"))
+        author_role_layout.addWidget(QLabel("一作"))
         author_role_layout.addWidget(self.first_author_edit, 1)
         author_role_layout.addWidget(QLabel("通讯作者"))
         author_role_layout.addWidget(self.corresponding_author_edit, 1)
+        publish_info_layout = QHBoxLayout()
+        publish_info_layout.addWidget(QLabel("出版社/期刊/会议"))
+        publish_info_layout.addWidget(self.publisher_edit, 2)
+        publish_info_layout.addWidget(QLabel("发表时间"))
+        publish_info_layout.addWidget(self.time_edit, 1)
         form.addRow("原文题目", self.title_edit)
         form.addRow("中文题目", self.title_zh_edit)
         form.addRow("作者", self.authors_edit)
         form.addRow("作者中文", self.authors_zh_edit)
-        form.addRow("作者标识", author_role_layout)
+        form.addRow("作者信息", author_role_layout)
         form.addRow("通讯作者单位", self.corresponding_affiliation_edit)
         form.addRow("通讯作者单位中文", self.corresponding_affiliation_zh_edit)
-        form.addRow("出版社/期刊/会议", self.publisher_edit)
-        form.addRow("发表时间", self.time_edit)
+        form.addRow("", publish_info_layout)
         form.addRow("", self.save_info_button)
         edit_layout.addWidget(fields_box)
 
@@ -328,9 +351,42 @@ class MainWindow(QMainWindow):
         archive_filter_layout.addWidget(self.archive_filter_clear_button)
         journal_layout.addLayout(archive_filter_layout)
 
-        self.archive_papers_table = QTableWidget(0, 8)
+        archive_tags_box = QGroupBox("所有标签")
+        archive_tags_layout = QGridLayout(archive_tags_box)
+        self.archive_all_tags_list = QListWidget()
+        self.archive_all_tags_list.setObjectName("archiveTagList")
+        self.archive_all_tags_list.setMaximumHeight(118)
+        self.archive_tag_new_name_edit = QLineEdit()
+        self.archive_tag_new_name_edit.setPlaceholderText("输入新标签名，和已有标签同名会自动合并")
+        self.archive_tag_rename_button = QPushButton("一键编辑标签")
+        self.archive_tag_merge_button = QPushButton("合并同名标签")
+        archive_tags_layout.addWidget(self.archive_all_tags_list, 0, 0, 3, 1)
+        archive_tags_layout.addWidget(QLabel("新标签名"), 0, 1)
+        archive_tags_layout.addWidget(self.archive_tag_new_name_edit, 1, 1)
+        archive_tag_buttons = QHBoxLayout()
+        archive_tag_buttons.addWidget(self.archive_tag_rename_button)
+        archive_tag_buttons.addWidget(self.archive_tag_merge_button)
+        archive_tag_buttons.addStretch()
+        archive_tags_layout.addLayout(archive_tag_buttons, 2, 1)
+        archive_tags_layout.setColumnStretch(0, 1)
+        archive_tags_layout.setColumnStretch(1, 2)
+        journal_layout.addWidget(archive_tags_box)
+
+        self.archive_papers_table = QTableWidget(0, 11)
         self.archive_papers_table.setHorizontalHeaderLabels(
-            ["期刊", "发表时间", "第一作者", "通讯作者", "通讯作者单位", "题目", "中文题目", "标签"]
+            [
+                "期刊",
+                "发表时间",
+                "第一作者",
+                "第一作者中文",
+                "通讯作者",
+                "通讯作者中文",
+                "通讯作者单位",
+                "通讯作者单位中文",
+                "题目",
+                "中文题目",
+                "标签",
+            ]
         )
         self.archive_papers_table.setEditTriggers(QTableWidget.NoEditTriggers)
         self.archive_papers_table.setSelectionBehavior(QTableWidget.SelectRows)
@@ -342,10 +398,13 @@ class MainWindow(QMainWindow):
         self.archive_papers_table.setColumnWidth(1, 110)
         self.archive_papers_table.setColumnWidth(2, 160)
         self.archive_papers_table.setColumnWidth(3, 160)
-        self.archive_papers_table.setColumnWidth(4, 260)
-        self.archive_papers_table.setColumnWidth(5, 320)
-        self.archive_papers_table.setColumnWidth(6, 320)
-        self.archive_papers_table.setColumnWidth(7, 180)
+        self.archive_papers_table.setColumnWidth(4, 160)
+        self.archive_papers_table.setColumnWidth(5, 160)
+        self.archive_papers_table.setColumnWidth(6, 260)
+        self.archive_papers_table.setColumnWidth(7, 260)
+        self.archive_papers_table.setColumnWidth(8, 320)
+        self.archive_papers_table.setColumnWidth(9, 320)
+        self.archive_papers_table.setColumnWidth(10, 180)
         journal_layout.addWidget(self.archive_papers_table)
 
         other_layout = QVBoxLayout(other_tab)
@@ -395,6 +454,9 @@ class MainWindow(QMainWindow):
         self.archive_search_edit.textChanged.connect(self.load_archive_papers_table)
         self.archive_tag_filter_combo.currentIndexChanged.connect(self.load_archive_papers_table)
         self.archive_filter_clear_button.clicked.connect(self.clear_archive_filters)
+        self.archive_all_tags_list.itemClicked.connect(self.on_archive_tag_clicked)
+        self.archive_tag_rename_button.clicked.connect(self.rename_selected_archive_tag)
+        self.archive_tag_merge_button.clicked.connect(self.merge_archive_same_name_tags)
         self.archive_papers_table.cellDoubleClicked.connect(
             lambda _row, _column: self.open_selected_archive_paper()
         )
@@ -405,6 +467,37 @@ class MainWindow(QMainWindow):
         self.setStyleSheet(
             """
             QMainWindow { background: #ffffff; }
+            QMenuBar {
+                background: #f8fafc;
+                border-bottom: 1px solid #e5e7eb;
+                padding: 3px 8px;
+            }
+            QMenuBar::item {
+                padding: 6px 10px;
+                background: transparent;
+            }
+            QMenuBar::item:selected { background: #e5e7eb; border-radius: 4px; }
+            QListWidget#navList {
+                border: none;
+                border-right: 1px solid #e5e7eb;
+                background: #f8fafc;
+                padding: 8px;
+            }
+            QListWidget#navList::item {
+                padding: 10px 12px;
+                border-radius: 6px;
+                color: #334155;
+            }
+            QListWidget#navList::item:selected {
+                background: #e2e8f0;
+                color: #0f172a;
+            }
+            QListWidget#archiveTagList {
+                border: 1px solid #cbd5e1;
+                border-radius: 6px;
+                background: #ffffff;
+            }
+            QListWidget#archiveTagList::item { padding: 5px 8px; }
             QPushButton {
                 padding: 8px 12px;
                 border-radius: 6px;
@@ -412,6 +505,18 @@ class MainWindow(QMainWindow):
                 background: #ffffff;
             }
             QPushButton:hover { background: #f1f5f9; }
+            QPushButton#parseButton {
+                color: #ffffff;
+                background: #2563eb;
+                border: 1px solid #1d4ed8;
+                font-weight: 700;
+            }
+            QPushButton#parseButton:hover { background: #1d4ed8; }
+            QPushButton#parseButton:disabled {
+                color: #dbeafe;
+                background: #93c5fd;
+                border-color: #93c5fd;
+            }
             QGroupBox {
                 font-weight: 600;
                 border: 1px solid #d1d5db;
@@ -426,6 +531,35 @@ class MainWindow(QMainWindow):
             }
             """
         )
+
+    def create_menu_bar(self) -> None:
+        file_menu = self.menuBar().addMenu("文件")
+        file_menu.addAction("导入 PDF/CAJ", self.choose_pdf)
+        file_menu.addAction("批量导入 PDF/CAJ", self.choose_pdfs)
+        file_menu.addAction("打开归档目录", self.open_archive_root)
+
+        window_menu = self.menuBar().addMenu("窗口")
+        for index, title in enumerate(("主页面", "论文检索", "设置", "其他")):
+            window_menu.addAction(title, lambda _checked=False, page=index: self.set_current_page(page))
+
+        help_menu = self.menuBar().addMenu("帮助")
+        help_menu.addAction(
+            "关于",
+            lambda: QMessageBox.information(
+                self,
+                "关于",
+                "论文识别归档软件\n用于 PDF/CAJ 元数据识别、归档、检索和标签管理。",
+            ),
+        )
+
+        settings_menu = self.menuBar().addMenu("设置")
+        settings_menu.addAction("API 设置", lambda: self.set_current_page(2))
+        settings_menu.addAction("归档目录", lambda: self.set_current_page(2))
+
+    def set_current_page(self, index: int) -> None:
+        if 0 <= index < self.pages.count():
+            self.nav_list.setCurrentRow(index)
+            self.pages.setCurrentIndex(index)
 
     def log_message(self, message: str) -> None:
         self.log.append(f"{datetime.now().strftime('%H:%M:%S')}  {message}")
@@ -493,12 +627,22 @@ class MainWindow(QMainWindow):
         QMessageBox.critical(self, "验证失败", f"API 配置可能不匹配。\n\n{reason}")
 
     def choose_pdf(self) -> None:
-        path, _ = QFileDialog.getOpenFileName(self, "选择 PDF", "", "PDF 文件 (*.pdf)")
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "选择论文文件",
+            "",
+            "论文文件 (*.pdf *.caj);;PDF 文件 (*.pdf);;CAJ 文件 (*.caj)",
+        )
         if path:
             self.set_pdfs([path])
 
     def choose_pdfs(self) -> None:
-        paths, _ = QFileDialog.getOpenFileNames(self, "批量选择 PDF", "", "PDF 文件 (*.pdf)")
+        paths, _ = QFileDialog.getOpenFileNames(
+            self,
+            "批量选择论文文件",
+            "",
+            "论文文件 (*.pdf *.caj);;PDF 文件 (*.pdf);;CAJ 文件 (*.caj)",
+        )
         if paths:
             self.set_pdfs(paths)
 
@@ -522,7 +666,7 @@ class MainWindow(QMainWindow):
             item.metadata.tags = tags_by_path.get(str(pdf_path), [])
             added_items.append(item)
         if not added_items:
-            self.status.setText("没有新增 PDF，重复文件已跳过。")
+            self.status.setText("没有新增文件，重复文件已跳过。")
             return
         first_new_index = len(self.paper_items)
         self.paper_items.extend(added_items)
@@ -539,13 +683,13 @@ class MainWindow(QMainWindow):
                     write_metadata_file(item.folder, payload)
                     item.json_payload = payload
         self.refresh_pdf_list()
-        self.drop_area.setText(f"已导入 {len(self.paper_items)} 个 PDF")
+        self.drop_area.setText(f"已导入 {len(self.paper_items)} 个论文文件")
         notice = f"，其中 {existing_count} 篇已读取旧 JSON" if existing_count else ""
         skipped = f"，跳过重复 {skipped_count} 个" if skipped_count else ""
         self.status.setText(
-            f"本次新增 {len(added_items)} 个 PDF{notice}{skipped}，点击“大模型解析”后会对比写入。"
+            f"本次新增 {len(added_items)} 个论文文件{notice}{skipped}，点击“大模型解析”后会优先读取已有归档。"
         )
-        self.log_message(f"新增 PDF 数量：{len(added_items)}{notice}{skipped}")
+        self.log_message(f"新增论文文件数量：{len(added_items)}{notice}{skipped}")
         self.update_current_view()
 
     def handle_dropped_folders(self, paths: list[str]) -> None:
@@ -580,10 +724,11 @@ class MainWindow(QMainWindow):
                     updated_json_count += 1
                 continue
 
-            for pdf_path in sorted(folder.rglob("*.pdf")):
-                pdf_paths.append(str(pdf_path))
-                tags_by_pdf.setdefault(str(pdf_path), []).append(tag)
-                imported_pdf_count += 1
+            for suffix in SUPPORTED_DOCUMENT_SUFFIXES:
+                for pdf_path in sorted(folder.rglob(f"*{suffix}")):
+                    pdf_paths.append(str(pdf_path))
+                    tags_by_pdf.setdefault(str(pdf_path), []).append(tag)
+                    imported_pdf_count += 1
 
         if pdf_paths:
             self.set_pdfs(pdf_paths, tags_by_pdf)
@@ -597,8 +742,8 @@ class MainWindow(QMainWindow):
         if unchanged_json_count:
             message_parts.append(f"{unchanged_json_count} 篇已包含该标签")
         if imported_pdf_count:
-            message_parts.append(f"已导入 {imported_pdf_count} 个 PDF，并预置文件夹标签")
-        message = "；".join(message_parts) or "没有找到可处理的论文 JSON 或 PDF。"
+            message_parts.append(f"已导入 {imported_pdf_count} 个论文文件，并预置文件夹标签")
+        message = "；".join(message_parts) or "没有找到可处理的论文 JSON、PDF 或 CAJ。"
         self.status.setText(message)
         self.log_message(message)
 
@@ -628,7 +773,7 @@ class MainWindow(QMainWindow):
 
     def remove_current_pdf(self) -> None:
         if not self.paper_items:
-            QMessageBox.information(self, "没有 PDF", "准备区里没有可删除的 PDF。")
+            QMessageBox.information(self, "没有文件", "准备区里没有可删除的论文文件。")
             return
         item = self.current_item()
         if not item:
@@ -641,10 +786,10 @@ class MainWindow(QMainWindow):
             self.current_paper_index = 0
         self.refresh_pdf_list()
         self.drop_area.setText(
-            f"已导入 {len(self.paper_items)} 个 PDF" if self.paper_items else "拖入一个或多个 PDF 到这里\n或点击“导入 PDF / 批量导入”"
+            f"已导入 {len(self.paper_items)} 个论文文件" if self.paper_items else "拖入一个或多个 PDF/CAJ 到这里\n或点击“导入 PDF/CAJ / 批量导入”"
         )
         self.status.setText(f"已从准备区删除：{removed_name}")
-        self.log_message(f"已从准备区删除 PDF：{removed_name}")
+        self.log_message(f"已从准备区删除论文文件：{removed_name}")
         self.update_current_view()
 
     def load_existing_for_item(self, item: PaperItem) -> bool:
@@ -708,15 +853,19 @@ class MainWindow(QMainWindow):
         pdf_path = None
         for key in ("source_pdf", "original_pdf", "pdf_path", "file_path"):
             candidate = stringify(payload.get(key))
-            if candidate and Path(candidate).exists() and Path(candidate).suffix.lower() == ".pdf":
+            if candidate and Path(candidate).exists() and Path(candidate).suffix.lower() in SUPPORTED_DOCUMENT_SUFFIXES:
                 pdf_path = Path(candidate)
                 break
         if pdf_path is None:
-            pdf_candidates = sorted(paper_folder.glob("*.pdf"))
+            pdf_candidates = sorted(
+                candidate
+                for suffix in SUPPORTED_DOCUMENT_SUFFIXES
+                for candidate in paper_folder.glob(f"*{suffix}")
+            )
             if pdf_candidates:
                 pdf_path = pdf_candidates[0]
         if pdf_path is None:
-            QMessageBox.warning(self, "缺少 PDF", "该归档文件夹里没有找到可读取的 PDF 文件。")
+            QMessageBox.warning(self, "缺少论文文件", "该归档文件夹里没有找到可读取的 PDF/CAJ 文件。")
             return
         self.sync_current_from_fields()
         item = PaperItem(
@@ -731,21 +880,21 @@ class MainWindow(QMainWindow):
         self.paper_items.append(item)
         self.current_paper_index = len(self.paper_items) - 1
         self.refresh_pdf_list()
-        self.drop_area.setText(f"已导入 {len(self.paper_items)} 个 PDF")
+        self.drop_area.setText(f"已导入 {len(self.paper_items)} 个论文文件")
         self.status.setText(f"已读取归档论文信息：{paper_folder}")
         self.log_message(f"已读取归档论文信息：{paper_folder}")
         self.update_current_view()
 
     def parse_pdfs(self) -> None:
         if not self.paper_items:
-            QMessageBox.warning(self, "缺少 PDF", "请先导入或拖入 PDF。")
+            QMessageBox.warning(self, "缺少论文文件", "请先导入或拖入 PDF/CAJ。")
             return
         self.sync_current_from_fields()
         config = self.current_api_config()
         self.progress.setRange(0, 0)
         self.parse_button.setEnabled(False)
         self.status.setText(
-            f"正在解析 {len(self.paper_items)} 个 PDF，调用 {PROVIDER_PRESETS[config.provider]['name']}..."
+            f"正在解析 {len(self.paper_items)} 个论文文件，调用 {PROVIDER_PRESETS[config.provider]['name']}..."
         )
         initial_tags_by_path = {
             str(item.pdf_path): item.metadata.tags
@@ -766,7 +915,9 @@ class MainWindow(QMainWindow):
     def on_item_finished(self, index: int, total: int, item: PaperItem) -> None:
         self.paper_items[index - 1] = item
         self.current_paper_index = index - 1
-        if item.duplicate:
+        if item.skipped_model:
+            flag = "已有完整归档，跳过大模型读取"
+        elif item.duplicate:
             changed_count = len(item.changed_fields)
             flag = f"重复，已读取旧 JSON，并用大模型结果更新 {changed_count} 个字段"
         else:
@@ -787,8 +938,8 @@ class MainWindow(QMainWindow):
         self.parse_button.setEnabled(True)
         count = len(self.paper_items)
         paper_count = sum(1 for item in self.paper_items if item.metadata.is_paper)
-        self.status.setText(f"批量处理完成：共 {count} 个 PDF，识别为论文 {paper_count} 个。")
-        self.log_message(f"批量处理完成：共 {count} 个 PDF，识别为论文 {paper_count} 个。")
+        self.status.setText(f"批量处理完成：共 {count} 个论文文件，识别为论文 {paper_count} 个。")
+        self.log_message(f"批量处理完成：共 {count} 个论文文件，识别为论文 {paper_count} 个。")
         self.update_current_view()
 
     def current_item(self) -> PaperItem | None:
@@ -918,7 +1069,7 @@ class MainWindow(QMainWindow):
     def archive_current(self) -> None:
         item = self.current_item()
         if not item:
-            QMessageBox.warning(self, "缺少 PDF", "请先导入或拖入 PDF。")
+            QMessageBox.warning(self, "缺少论文文件", "请先导入或拖入 PDF/CAJ。")
             return
         self.sync_current_from_fields()
         if not (item.metadata.title or item.metadata.title_zh):
@@ -943,7 +1094,7 @@ class MainWindow(QMainWindow):
         if duplicate:
             message = f"检测到重复论文，未新增归档，已读取旧记录和人工笔记：\n{folder}"
         else:
-            message = f"PDF 和 metadata.json 已保存到：\n{folder}"
+            message = f"原文件和 metadata.json 已保存到：\n{folder}"
         self.status.setText(message.replace("\n", " "))
         self.log_message(message.replace("\n", " "))
         QMessageBox.information(self, "归档结果", message)
@@ -1017,7 +1168,7 @@ class MainWindow(QMainWindow):
         message = (
             f"归档文件夹：{self.archive_root()}\n"
             f"论文记录：{stats['folders']}\n"
-            f"PDF 文件：{stats['pdfs']}\n"
+            f"论文文件：{stats['pdfs']}\n"
             f"JSON 文件：{stats['jsons']}\n"
             f"识别为论文：{stats['papers']}\n"
             f"识别为非论文：{stats['non_papers']}\n"
@@ -1028,8 +1179,13 @@ class MainWindow(QMainWindow):
 
     def load_archive_papers_table(self) -> None:
         rows = archived_paper_rows(self.archive_root())
-        all_tags = sorted({tag for _folder, metadata in rows for tag in metadata.tags})
+        tag_counts: dict[str, int] = {}
+        for _folder, metadata in rows:
+            for tag in metadata.tags:
+                tag_counts[tag] = tag_counts.get(tag, 0) + 1
+        all_tags = sorted(tag_counts)
         self.update_archive_tag_filter_options(all_tags)
+        self.update_archive_all_tags_list(tag_counts)
 
         query = self.archive_search_edit.text().strip().lower()
         selected_tag = self.archive_tag_filter_combo.currentData() or ""
@@ -1048,9 +1204,11 @@ class MainWindow(QMainWindow):
                 metadata.publisher or metadata.publisher_zh,
                 metadata.published_time,
                 metadata.first_author,
+                self.first_author_zh(metadata),
                 metadata.corresponding_author,
-                metadata.corresponding_author_affiliation
-                or metadata.corresponding_author_affiliation_zh,
+                self.corresponding_author_zh(metadata),
+                metadata.corresponding_author_affiliation,
+                metadata.corresponding_author_affiliation_zh,
                 metadata.title,
                 metadata.title_zh,
                 tags_text,
@@ -1065,6 +1223,35 @@ class MainWindow(QMainWindow):
         self.archive_papers_table.resizeRowsToContents()
         self.log_message(f"已刷新归档论文表格：{len(rows)} 篇")
 
+    def first_author_zh(self, metadata: PaperMetadata) -> str:
+        return self.author_zh_at(metadata, 0)
+
+    def corresponding_author_zh(self, metadata: PaperMetadata) -> str:
+        author = metadata.corresponding_author.strip()
+        if not author:
+            return ""
+        authors = self.split_author_names(metadata.authors)
+        authors_zh = self.split_author_names(metadata.authors_zh)
+        if not authors or not authors_zh:
+            return ""
+        for index, candidate in enumerate(authors):
+            if candidate == author and index < len(authors_zh):
+                return authors_zh[index]
+        return ""
+
+    def author_zh_at(self, metadata: PaperMetadata, index: int) -> str:
+        authors_zh = self.split_author_names(metadata.authors_zh)
+        return authors_zh[index] if index < len(authors_zh) else ""
+
+    def split_author_names(self, text: str) -> list[str]:
+        separators_normalized = (
+            text.replace("，", ",")
+            .replace("、", ",")
+            .replace("；", ",")
+            .replace(";", ",")
+        )
+        return [part.strip() for part in separators_normalized.split(",") if part.strip()]
+
     def update_archive_tag_filter_options(self, tags: list[str]) -> None:
         current_tag = self.archive_tag_filter_combo.currentData() or ""
         self.archive_tag_filter_combo.blockSignals(True)
@@ -1075,6 +1262,86 @@ class MainWindow(QMainWindow):
         index = self.archive_tag_filter_combo.findData(current_tag)
         self.archive_tag_filter_combo.setCurrentIndex(index if index >= 0 else 0)
         self.archive_tag_filter_combo.blockSignals(False)
+
+    def update_archive_all_tags_list(self, tag_counts: dict[str, int]) -> None:
+        current_tag = ""
+        current_item = self.archive_all_tags_list.currentItem()
+        if current_item:
+            current_tag = current_item.data(Qt.UserRole) or ""
+        self.archive_all_tags_list.blockSignals(True)
+        self.archive_all_tags_list.clear()
+        selected_row = -1
+        for row, tag in enumerate(sorted(tag_counts)):
+            item = QListWidgetItem(f"{tag} ({tag_counts[tag]})")
+            item.setData(Qt.UserRole, tag)
+            item.setToolTip(tag)
+            self.archive_all_tags_list.addItem(item)
+            if tag == current_tag:
+                selected_row = row
+        if selected_row >= 0:
+            self.archive_all_tags_list.setCurrentRow(selected_row)
+        self.archive_all_tags_list.blockSignals(False)
+
+    def on_archive_tag_clicked(self, item: QListWidgetItem) -> None:
+        tag = item.data(Qt.UserRole) or ""
+        self.archive_tag_new_name_edit.setText(tag)
+        index = self.archive_tag_filter_combo.findData(tag)
+        if index >= 0:
+            self.archive_tag_filter_combo.setCurrentIndex(index)
+
+    def rename_selected_archive_tag(self) -> None:
+        item = self.archive_all_tags_list.currentItem()
+        if not item:
+            QMessageBox.information(self, "未选择标签", "请先在“所有标签”里选择一个标签。")
+            return
+        old_tag = str(item.data(Qt.UserRole) or "").strip()
+        new_tag = self.archive_tag_new_name_edit.text().strip()
+        if not old_tag:
+            return
+        if not new_tag:
+            QMessageBox.warning(self, "缺少新标签名", "请输入新的标签名。")
+            return
+
+        changed_count = self.rewrite_archive_tags(old_tag, new_tag)
+        if changed_count:
+            self.log_message(f"已将标签“{old_tag}”改为“{new_tag}”，同名标签已自动合并：{changed_count} 篇")
+            self.status.setText(f"已编辑标签：{old_tag} -> {new_tag}，影响 {changed_count} 篇论文")
+        else:
+            self.status.setText("标签未发生变化。")
+        self.archive_tag_new_name_edit.setText(new_tag)
+        self.load_archive_papers_table()
+
+    def merge_archive_same_name_tags(self) -> None:
+        changed_count = self.rewrite_archive_tags()
+        if changed_count:
+            self.log_message(f"已合并同名标签：{changed_count} 篇")
+            self.status.setText(f"已合并同名标签，更新 {changed_count} 篇论文")
+        else:
+            self.status.setText("没有需要合并的同名标签。")
+        self.load_archive_papers_table()
+
+    def rewrite_archive_tags(self, old_tag: str = "", new_tag: str = "") -> int:
+        changed_count = 0
+        for folder, _metadata in archived_paper_rows(self.archive_root()):
+            payload = read_metadata_file(folder / "metadata.json")
+            raw_value = payload.get("tags", [])
+            if isinstance(raw_value, list):
+                raw_tags = raw_value
+            else:
+                raw_tags = str(raw_value or "").replace("，", ",").replace("、", ",").split(",")
+            old_tags = [str(tag).strip() for tag in raw_tags if str(tag).strip()]
+            rewritten_tags: list[str] = []
+            for clean_tag in old_tags:
+                replacement = new_tag if old_tag and clean_tag == old_tag else clean_tag
+                if replacement and replacement not in rewritten_tags:
+                    rewritten_tags.append(replacement)
+            if rewritten_tags == old_tags:
+                continue
+            payload["tags"] = rewritten_tags
+            write_metadata_file(folder, payload)
+            self.update_loaded_item_from_payload(folder, payload)
+            changed_count += 1
+        return changed_count
 
     def archive_row_matches(
         self, metadata: PaperMetadata, query: str, selected_tag: str

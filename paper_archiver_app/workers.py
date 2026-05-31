@@ -2,8 +2,8 @@ from pathlib import Path
 
 from PyQt5.QtCore import QThread, pyqtSignal
 
-from .api_client import build_prompt, call_openai_compatible_api, extract_pdf_text, validate_openai_compatible_api
-from .archive_store import archive_paper, find_duplicate, pdf_hash
+from .api_client import build_prompt, call_openai_compatible_api, extract_document_text, validate_openai_compatible_api
+from .archive_store import archive_paper, find_duplicate, metadata_is_complete, pdf_hash, write_metadata_file
 from .external_lookup import google_scholar_author_url, query_journal_partitions
 from .metadata import metadata_from_dict
 from .models import ApiConfig, PaperItem, PaperMetadata
@@ -32,15 +32,37 @@ class ParseWorker(QThread):
         total = len(self.pdf_paths)
         for index, pdf_path in enumerate(self.pdf_paths, start=1):
             try:
+                initial_tags = self.initial_tags_by_path.get(str(pdf_path), [])
                 old_folder, old_payload = find_duplicate(
                     self.archive_root, paper_hash=pdf_hash(pdf_path), pdf_path=pdf_path
                 )
-                text = extract_pdf_text(pdf_path)
-                prompt = build_prompt(text)
-                metadata = call_openai_compatible_api(prompt, self.config)
-                initial_tags = self.initial_tags_by_path.get(str(pdf_path), [])
+                if old_folder and old_payload:
+                    old_metadata = metadata_from_dict(old_payload)
+                    if initial_tags:
+                        merged_tags = unique_tags(old_metadata.tags + initial_tags)
+                        if merged_tags != old_metadata.tags:
+                            old_payload["tags"] = merged_tags
+                            write_metadata_file(old_folder, old_payload)
+                            old_metadata = metadata_from_dict(old_payload)
+                    if metadata_is_complete(old_metadata):
+                        item = PaperItem(
+                            pdf_path=pdf_path,
+                            metadata=old_metadata,
+                            prompt=stringify(old_payload.get("model_prompt")),
+                            folder=old_folder,
+                            duplicate=True,
+                            json_payload=old_payload,
+                            note=stringify(old_payload.get("manual_notes")),
+                            skipped_model=True,
+                        )
+                        self.itemFinished.emit(index, total, item)
+                        continue
+
+                text = extract_document_text(pdf_path)
+                prompt = build_prompt(text, pdf_path.name)
+                metadata = call_openai_compatible_api(prompt, self.config, text)
                 if initial_tags:
-                    metadata.tags = list(dict.fromkeys(metadata.tags + initial_tags))
+                    metadata.tags = unique_tags(metadata.tags + initial_tags)
                 folder, payload, duplicate, changed_fields = archive_paper(
                     pdf_path, self.archive_root, metadata, prompt
                 )
@@ -59,6 +81,14 @@ class ParseWorker(QThread):
             except Exception as exc:
                 self.failed.emit(index, total, str(pdf_path), str(exc))
         self.finished.emit()
+
+def unique_tags(tags: list[str]) -> list[str]:
+    merged: list[str] = []
+    for tag in tags:
+        clean_tag = str(tag).strip()
+        if clean_tag and clean_tag not in merged:
+            merged.append(clean_tag)
+    return merged
 
 class ValidateWorker(QThread):
     succeeded = pyqtSignal(str)

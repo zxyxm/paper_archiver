@@ -40,3 +40,4 @@ class PaperItem:
     json_payload: dict = field(default_factory=dict)
     note: str = ""
     changed_fields: set[str] = field(default_factory=set)
+    skipped_model: bool = False
