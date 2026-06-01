@@ -2,13 +2,44 @@ import hashlib
 import json
 import re
 import shutil
-from dataclasses import asdict
+from dataclasses import asdict, dataclass, field, fields
 from datetime import datetime
 from pathlib import Path
 
-from .metadata import metadata_from_dict
+from .metadata import metadata_from_dict, tags_from_value
 from .models import PaperMetadata
 from .utils import boolify, compact_text, normalized_title, stringify
+
+ARCHIVE_SCHEMA_VERSION = 2
+ARCHIVED_DOCUMENT_SUFFIXES = {".pdf", ".caj"}
+
+
+@dataclass
+class ArchiveMaintenanceSummary:
+    scanned: int = 0
+    updated: int = 0
+    skipped: int = 0
+    errors: list[str] = field(default_factory=list)
+    changed_fields: dict[str, int] = field(default_factory=dict)
+
+    def record_changes(self, changed_fields: set[str]) -> None:
+        if not changed_fields:
+            return
+        self.updated += 1
+        for name in changed_fields:
+            self.changed_fields[name] = self.changed_fields.get(name, 0) + 1
+
+    @property
+    def failed(self) -> int:
+        return len(self.errors)
+
+
+def metadata_field_names() -> list[str]:
+    return [field_info.name for field_info in fields(PaperMetadata)]
+
+
+def current_metadata_defaults() -> dict:
+    return asdict(PaperMetadata())
 
 
 def pdf_hash(pdf_path: Path) -> str:
@@ -27,6 +58,98 @@ def write_metadata_file(folder: Path, payload: dict) -> None:
     payload["updated_at"] = datetime.now().isoformat(timespec="seconds")
     with (folder / "metadata.json").open("w", encoding="utf-8") as fh:
         json.dump(payload, fh, ensure_ascii=False, indent=2)
+
+def archive_document_paths(folder: Path) -> list[Path]:
+    return sorted(
+        path
+        for path in folder.iterdir()
+        if path.is_file() and path.suffix.lower() in ARCHIVED_DOCUMENT_SUFFIXES
+    )
+
+def first_existing_document(folder: Path, payload: dict) -> Path | None:
+    for key in ("source_pdf", "original_pdf", "pdf_path", "file_path"):
+        candidate = stringify(payload.get(key))
+        if not candidate:
+            continue
+        path = Path(candidate)
+        if path.exists() and path.is_file():
+            return path
+    documents = archive_document_paths(folder)
+    return documents[0] if documents else None
+
+def normalize_metadata_payload(folder: Path, payload: dict) -> tuple[dict, set[str]]:
+    original = dict(payload or {})
+    normalized = dict(original)
+    metadata = metadata_from_dict(original)
+    metadata_values = asdict(metadata)
+    defaults = current_metadata_defaults()
+    changed_fields: set[str] = set()
+
+    for name in metadata_field_names():
+        value = metadata_values.get(name, defaults.get(name))
+        if name == "tags":
+            value = tags_from_value(value)
+        if normalized.get(name) != value:
+            normalized[name] = value
+            changed_fields.add(name)
+
+    for name, value in {
+        "archive_schema_version": ARCHIVE_SCHEMA_VERSION,
+        "manual_notes": stringify(original.get("manual_notes") or original.get("notes")),
+        "model_prompt": stringify(original.get("model_prompt") or original.get("prompt")),
+    }.items():
+        if normalized.get(name) != value:
+            normalized[name] = value
+            changed_fields.add(name)
+
+    document_path = first_existing_document(folder, normalized)
+    if document_path:
+        source_pdf = stringify(normalized.get("source_pdf"))
+        if not source_pdf or not Path(source_pdf).exists():
+            normalized["source_pdf"] = str(document_path)
+            changed_fields.add("source_pdf")
+        if not stringify(normalized.get("original_pdf")):
+            normalized["original_pdf"] = stringify(original.get("original_pdf")) or str(document_path)
+            changed_fields.add("original_pdf")
+        if not stringify(normalized.get("paper_hash")):
+            try:
+                normalized["paper_hash"] = pdf_hash(document_path)
+                changed_fields.add("paper_hash")
+            except OSError:
+                pass
+
+    if not stringify(normalized.get("created_at")):
+        normalized["created_at"] = (
+            stringify(original.get("updated_at"))
+            or datetime.now().isoformat(timespec="seconds")
+        )
+        changed_fields.add("created_at")
+
+    if changed_fields:
+        normalized["schema_migrated_at"] = datetime.now().isoformat(timespec="seconds")
+        changed_fields.add("schema_migrated_at")
+
+    return normalized, changed_fields
+
+def organize_archive_payloads(root_dir: Path) -> ArchiveMaintenanceSummary:
+    summary = ArchiveMaintenanceSummary()
+    if not root_dir.exists():
+        return summary
+    for metadata_file in root_dir.glob("*/metadata.json"):
+        summary.scanned += 1
+        try:
+            payload = read_metadata_file(metadata_file)
+            normalized, changed_fields = normalize_metadata_payload(
+                metadata_file.parent, payload
+            )
+            if changed_fields:
+                write_metadata_file(metadata_file.parent, normalized)
+                summary.record_changes(changed_fields)
+            else:
+                summary.skipped += 1
+        except (OSError, json.JSONDecodeError) as exc:
+            summary.errors.append(f"{metadata_file}: {exc}")
+    return summary
 
 def iter_archive_payloads(root_dir: Path):
     if not root_dir.exists():
@@ -254,7 +377,7 @@ def archive_statistics(root_dir: Path) -> dict:
     for folder, payload in iter_archive_payloads(root_dir):
         folders += 1
         jsons += 1
-        pdfs += len(list(folder.glob("*.pdf"))) + len(list(folder.glob("*.caj")))
+        pdfs += len(archive_document_paths(folder))
         if stringify(payload.get("manual_notes")):
             notes += 1
         if boolify(payload.get("is_paper", True)):
@@ -269,4 +392,21 @@ def archive_statistics(root_dir: Path) -> dict:
         "non_papers": non_papers,
         "notes": notes,
     }
+
+def rewrite_archive_tags(root_dir: Path, old_tag: str = "", new_tag: str = "") -> int:
+    changed_count = 0
+    for folder, _metadata in archived_paper_rows(root_dir):
+        payload = read_metadata_file(folder / "metadata.json")
+        old_tags = tags_from_value(payload.get("tags", []))
+        rewritten_tags: list[str] = []
+        for clean_tag in old_tags:
+            replacement = new_tag if old_tag and clean_tag == old_tag else clean_tag
+            if replacement and replacement not in rewritten_tags:
+                rewritten_tags.append(replacement)
+        if rewritten_tags == old_tags:
+            continue
+        payload["tags"] = rewritten_tags
+        write_metadata_file(folder, payload)
+        changed_count += 1
+    return changed_count
 

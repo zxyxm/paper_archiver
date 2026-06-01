@@ -5,32 +5,14 @@ from datetime import datetime
 from pathlib import Path
 from urllib.parse import quote_plus
 
-from PyQt5.QtCore import Qt, QUrl, pyqtSignal
-from PyQt5.QtGui import QDesktopServices, QDragEnterEvent, QDropEvent
+from PyQt5.QtCore import Qt, QUrl
+from PyQt5.QtGui import QDesktopServices
 from PyQt5.QtWidgets import (
-    QComboBox,
     QFileDialog,
-    QFormLayout,
-    QFrame,
-    QGridLayout,
-    QGroupBox,
-    QHBoxLayout,
-    QLabel,
-    QLineEdit,
+    QListWidgetItem,
     QMainWindow,
     QMessageBox,
-    QPushButton,
-    QProgressBar,
-    QListWidget,
-    QListWidgetItem,
-    QScrollArea,
-    QStackedWidget,
-    QTabWidget,
-    QTableWidget,
     QTableWidgetItem,
-    QTextEdit,
-    QVBoxLayout,
-    QWidget,
 )
 
 from .api_client import SUPPORTED_DOCUMENT_SUFFIXES, normalize_chat_completions_url
@@ -39,61 +21,25 @@ from .archive_store import (
     archive_statistics,
     archived_paper_rows,
     find_duplicate,
+    organize_archive_payloads,
     pdf_hash,
     read_metadata_file,
+    rewrite_archive_tags as rewrite_archive_tags_in_store,
     write_metadata_file,
 )
 from .config_store import load_config, save_config
 from .constants import DEFAULT_ARCHIVE_ROOT, PROVIDER_PRESETS
+from .ui_sections import (
+    apply_main_window_styles,
+    build_main_window,
+    connect_main_window_signals,
+)
 from .metadata import metadata_from_dict
 from .models import ApiConfig, PaperItem, PaperMetadata
 from .preview import model_interaction_text
 from .utils import stringify
 from .workers import JournalLookupWorker, ParseWorker, ScholarWorker, ValidateWorker
 
-
-class DropArea(QLabel):
-    pdfDropped = pyqtSignal(list)
-    folderDropped = pyqtSignal(list)
-
-    def __init__(self):
-        super().__init__("拖入一个或多个 PDF/CAJ 或文件夹到这里\n文件夹名会作为论文标签写入")
-        self.setAlignment(Qt.AlignCenter)
-        self.setAcceptDrops(True)
-        self.setMinimumHeight(110)
-        self.setStyleSheet(
-            """
-            QLabel {
-                border: 2px dashed #6b7280;
-                border-radius: 8px;
-                color: #374151;
-                background: #f8fafc;
-                font-size: 16px;
-            }
-            """
-        )
-
-    def dragEnterEvent(self, event: QDragEnterEvent) -> None:
-        paths = [url.toLocalFile() for url in event.mimeData().urls()]
-        if any(Path(path).suffix.lower() in SUPPORTED_DOCUMENT_SUFFIXES or Path(path).is_dir() for path in paths):
-            event.acceptProposedAction()
-            return
-        event.ignore()
-
-    def dropEvent(self, event: QDropEvent) -> None:
-        paths = [url.toLocalFile() for url in event.mimeData().urls()]
-        pdf_paths = [
-            url.toLocalFile()
-            for url in event.mimeData().urls()
-            if Path(url.toLocalFile()).suffix.lower() in SUPPORTED_DOCUMENT_SUFFIXES
-        ]
-        folder_paths = [path for path in paths if Path(path).is_dir()]
-        if pdf_paths:
-            self.pdfDropped.emit(pdf_paths)
-        if folder_paths:
-            self.folderDropped.emit(folder_paths)
-        if pdf_paths or folder_paths:
-            event.acceptProposedAction()
 
 class MainWindow(QMainWindow):
     def __init__(self):
@@ -109,428 +55,12 @@ class MainWindow(QMainWindow):
         self.journal_worker: JournalLookupWorker | None = None
         self.current_journal_url = ""
 
-        shell = QWidget()
-        shell_layout = QHBoxLayout(shell)
-        shell_layout.setContentsMargins(0, 0, 0, 0)
-        shell_layout.setSpacing(0)
-        self.setCentralWidget(shell)
-
-        self.nav_list = QListWidget()
-        self.nav_list.setObjectName("navList")
-        self.nav_list.setFixedWidth(168)
-        self.nav_list.addItems(["主页面", "论文检索", "设置", "其他"])
-        self.nav_list.setCurrentRow(0)
-        shell_layout.addWidget(self.nav_list)
-
-        self.pages = QStackedWidget()
-        shell_layout.addWidget(self.pages, 1)
-
-        main_tab = QWidget()
-        settings_tab = QWidget()
-        other_tab = QWidget()
-        journal_tab = QWidget()
-        self.pages.addWidget(main_tab)
-        self.pages.addWidget(journal_tab)
-        self.pages.addWidget(settings_tab)
-        self.pages.addWidget(other_tab)
-        self.nav_list.currentRowChanged.connect(self.pages.setCurrentIndex)
-        self.create_menu_bar()
-
-        root = QVBoxLayout(main_tab)
-        settings_layout = QVBoxLayout(settings_tab)
-        self.drop_area = DropArea()
-        self.drop_area.pdfDropped.connect(self.set_pdfs)
-        self.drop_area.folderDropped.connect(self.handle_dropped_folders)
-        root.addWidget(self.drop_area)
-        self.pdf_list = QListWidget()
-        self.pdf_list.setMaximumHeight(120)
-        self.pdf_list.currentRowChanged.connect(self.on_pdf_list_row_changed)
-        root.addWidget(self.pdf_list)
-
-        controls = QHBoxLayout()
-        self.import_button = QPushButton("导入 PDF/CAJ")
-        self.batch_import_button = QPushButton("批量导入 PDF/CAJ")
-        self.remove_pdf_button = QPushButton("删除当前文件")
-        self.parse_button = QPushButton("大模型解析")
-        self.parse_button.setObjectName("parseButton")
-        self.scholar_button = QPushButton("Google Scholar 主页")
-        controls.addWidget(self.import_button)
-        controls.addWidget(self.batch_import_button)
-        controls.addWidget(self.remove_pdf_button)
-        controls.addWidget(self.parse_button)
-        controls.addWidget(self.scholar_button)
-        controls.addStretch()
-        root.addLayout(controls)
-
-        self.status = QLabel("请选择或拖入 PDF/CAJ。")
-        self.progress = QProgressBar()
-        self.progress.setRange(0, 1)
-        self.progress.setValue(0)
-        root.addWidget(self.status)
-        root.addWidget(self.progress)
-
-        paper_nav_box = QGroupBox("当前论文")
-        paper_nav_layout = QHBoxLayout(paper_nav_box)
-        self.prev_paper_button = QPushButton("上一篇")
-        self.next_paper_button = QPushButton("下一篇")
-        self.paper_position_label = QLabel("暂无论文")
-        self.paper_position_label.setAlignment(Qt.AlignCenter)
-        self.existing_notice = QLabel("")
-        self.existing_notice.setStyleSheet("color: #b45309; font-weight: 600;")
-        paper_nav_layout.addWidget(self.prev_paper_button)
-        paper_nav_layout.addWidget(self.next_paper_button)
-        paper_nav_layout.addWidget(self.paper_position_label, 1)
-        paper_nav_layout.addWidget(self.existing_notice, 2)
-        root.addWidget(paper_nav_box)
-
-        api_box = QGroupBox("大模型 API")
-        api_layout = QGridLayout(api_box)
-        self.provider_combo = QComboBox()
-        for key, preset in PROVIDER_PRESETS.items():
-            self.provider_combo.addItem(preset["name"], key)
-        self.base_url_edit = QLineEdit()
-        self.model_edit = QLineEdit()
-        self.api_key_edit = QLineEdit()
-        self.api_key_edit.setEchoMode(QLineEdit.Password)
-        self.auth_header_edit = QLineEdit()
-        self.validate_key_button = QPushButton("验证 API Key")
-        self.save_key_button = QPushButton("保存 API Key")
-        self.validate_key_button.setFixedWidth(110)
-        self.save_key_button.setFixedWidth(110)
-        api_buttons = QHBoxLayout()
-        api_buttons.addWidget(self.validate_key_button)
-        api_buttons.addWidget(self.save_key_button)
-        api_buttons.addStretch()
-        api_layout.addWidget(QLabel("服务"), 0, 0)
-        api_layout.addWidget(self.provider_combo, 0, 1)
-        api_layout.addWidget(QLabel("API 地址"), 0, 2)
-        api_layout.addWidget(self.base_url_edit, 0, 3)
-        api_layout.addWidget(QLabel("模型"), 1, 0)
-        api_layout.addWidget(self.model_edit, 1, 1)
-        api_layout.addWidget(QLabel("API Key"), 1, 2)
-        api_layout.addWidget(self.api_key_edit, 1, 3)
-        api_layout.addWidget(QLabel("认证头"), 2, 0)
-        api_layout.addWidget(self.auth_header_edit, 2, 1)
-        api_layout.addLayout(api_buttons, 2, 2, 1, 2)
-        settings_layout.addWidget(api_box)
-
-        archive_box = QGroupBox("归档目录")
-        archive_layout = QHBoxLayout(archive_box)
-        self.archive_root_edit = QLineEdit(str(DEFAULT_ARCHIVE_ROOT))
-        self.choose_archive_button = QPushButton("选择目录")
-        self.open_archive_button = QPushButton("打开目录")
-        self.open_paper_folder_button = QPushButton("打开论文文件夹")
-        self.archive_stats_button = QPushButton("日志")
-        archive_layout.addWidget(self.archive_root_edit)
-        archive_layout.addWidget(self.choose_archive_button)
-        archive_layout.addWidget(self.open_archive_button)
-        archive_layout.addWidget(self.open_paper_folder_button)
-        archive_layout.addWidget(self.archive_stats_button)
-        settings_layout.addWidget(archive_box)
-        settings_layout.addStretch()
-
-        edit_scroll = QScrollArea()
-        edit_scroll.setWidgetResizable(True)
-        edit_scroll.setFrameShape(QFrame.NoFrame)
-        edit_panel = QWidget()
-        edit_layout = QVBoxLayout(edit_panel)
-        edit_scroll.setWidget(edit_panel)
-        root.addWidget(edit_scroll, 1)
-
-        fields_box = QGroupBox("论文信息编辑")
-        form = QFormLayout(fields_box)
-        self.title_edit = QLineEdit()
-        self.title_zh_edit = QLineEdit()
-        self.authors_edit = QLineEdit()
-        self.authors_zh_edit = QLineEdit()
-        self.first_author_edit = QLineEdit()
-        self.corresponding_author_edit = QLineEdit()
-        self.corresponding_affiliation_edit = QLineEdit()
-        self.corresponding_affiliation_zh_edit = QLineEdit()
-        self.publisher_edit = QLineEdit()
-        self.time_edit = QLineEdit()
-        self.save_info_button = QPushButton("保存论文信息")
-        author_role_layout = QHBoxLayout()
-        author_role_layout.addWidget(QLabel("一作"))
-        author_role_layout.addWidget(self.first_author_edit, 1)
-        author_role_layout.addWidget(QLabel("通讯作者"))
-        author_role_layout.addWidget(self.corresponding_author_edit, 1)
-        publish_info_layout = QHBoxLayout()
-        publish_info_layout.addWidget(QLabel("出版社/期刊/会议"))
-        publish_info_layout.addWidget(self.publisher_edit, 2)
-        publish_info_layout.addWidget(QLabel("发表时间"))
-        publish_info_layout.addWidget(self.time_edit, 1)
-        form.addRow("原文题目", self.title_edit)
-        form.addRow("中文题目", self.title_zh_edit)
-        form.addRow("作者", self.authors_edit)
-        form.addRow("作者中文", self.authors_zh_edit)
-        form.addRow("作者信息", author_role_layout)
-        form.addRow("通讯作者单位", self.corresponding_affiliation_edit)
-        form.addRow("通讯作者单位中文", self.corresponding_affiliation_zh_edit)
-        form.addRow("", publish_info_layout)
-        form.addRow("", self.save_info_button)
-        edit_layout.addWidget(fields_box)
-
-        summary_box = QGroupBox("摘要与笔记")
-        summary_layout = QGridLayout(summary_box)
-        self.abstract_zh_edit = QTextEdit()
-        self.abstract_en_edit = QTextEdit()
-        self.plain_summary_edit = QTextEdit()
-        self.note_edit = QTextEdit()
-        self.tags_edit = QLineEdit()
-        self.tags_edit.setPlaceholderText("输入自定义标签，用逗号分隔，例如 综述, 代谢组, 待精读")
-        self.save_note_button = QPushButton("保存人工笔记")
-        for editor in (
-            self.abstract_zh_edit,
-            self.abstract_en_edit,
-            self.plain_summary_edit,
-            self.note_edit,
-        ):
-            editor.setMinimumHeight(170)
-        self.abstract_tabs = QTabWidget()
-        self.abstract_tabs.addTab(self.abstract_zh_edit, "中文摘要")
-        self.abstract_tabs.addTab(self.abstract_en_edit, "English Abstract")
-        self.abstract_tabs.setCurrentIndex(0)
-        summary_layout.addWidget(self.abstract_tabs, 0, 0, 1, 2)
-        summary_layout.addWidget(QLabel("标签"), 1, 0)
-        summary_layout.addWidget(self.tags_edit, 1, 1)
-        summary_layout.addWidget(QLabel("大白话"), 2, 0)
-        summary_layout.addWidget(QLabel("人工笔记"), 2, 1)
-        summary_layout.addWidget(self.plain_summary_edit, 3, 0)
-        summary_layout.addWidget(self.note_edit, 3, 1)
-        summary_layout.addWidget(self.save_note_button, 4, 1)
-        edit_layout.addWidget(summary_box)
-        edit_layout.addStretch()
-
-        journal_layout = QVBoxLayout(journal_tab)
-        journal_controls = QHBoxLayout()
-        self.journal_query_edit = QLineEdit()
-        self.journal_query_edit.setPlaceholderText("输入期刊名，例如 Scientific Reports")
-        self.journal_use_current_button = QPushButton("使用当前期刊")
-        self.journal_search_button = QPushButton("查询分区")
-        self.journal_open_button = QPushButton("打开来源页面")
-        journal_controls.addWidget(self.journal_query_edit, 1)
-        journal_controls.addWidget(self.journal_use_current_button)
-        journal_controls.addWidget(self.journal_search_button)
-        journal_controls.addWidget(self.journal_open_button)
-        journal_layout.addLayout(journal_controls)
-        self.journal_result = QTextEdit()
-        self.journal_result.setReadOnly(True)
-        self.journal_result.setPlaceholderText("这里显示期刊的中科院分区、JCR/WOS 分区和来源链接。")
-        journal_layout.addWidget(self.journal_result)
-
-        for widget in (
-            self.journal_query_edit,
-            self.journal_use_current_button,
-            self.journal_search_button,
-            self.journal_open_button,
-            self.journal_result,
-        ):
-            widget.hide()
-
-        archive_controls = QHBoxLayout()
-        self.archive_papers_refresh_button = QPushButton("刷新归档论文")
-        self.archive_papers_open_button = QPushButton("打开选中论文文件夹")
-        self.archive_papers_count_label = QLabel("共 0 篇论文")
-        archive_controls.addWidget(self.archive_papers_refresh_button)
-        archive_controls.addWidget(self.archive_papers_open_button)
-        archive_controls.addWidget(self.archive_papers_count_label)
-        archive_controls.addStretch()
-        journal_layout.addLayout(archive_controls)
-
-        archive_filter_layout = QHBoxLayout()
-        self.archive_search_edit = QLineEdit()
-        self.archive_search_edit.setPlaceholderText("检索题目、中文题目、作者、期刊、通讯作者单位或标签")
-        self.archive_tag_filter_combo = QComboBox()
-        self.archive_tag_filter_combo.addItem("全部标签", "")
-        self.archive_filter_clear_button = QPushButton("清空筛选")
-        archive_filter_layout.addWidget(QLabel("检索"))
-        archive_filter_layout.addWidget(self.archive_search_edit, 1)
-        archive_filter_layout.addWidget(QLabel("标签"))
-        archive_filter_layout.addWidget(self.archive_tag_filter_combo)
-        archive_filter_layout.addWidget(self.archive_filter_clear_button)
-        journal_layout.addLayout(archive_filter_layout)
-
-        archive_tags_box = QGroupBox("所有标签")
-        archive_tags_layout = QGridLayout(archive_tags_box)
-        self.archive_all_tags_list = QListWidget()
-        self.archive_all_tags_list.setObjectName("archiveTagList")
-        self.archive_all_tags_list.setMaximumHeight(118)
-        self.archive_tag_new_name_edit = QLineEdit()
-        self.archive_tag_new_name_edit.setPlaceholderText("输入新标签名，和已有标签同名会自动合并")
-        self.archive_tag_rename_button = QPushButton("一键编辑标签")
-        self.archive_tag_merge_button = QPushButton("合并同名标签")
-        archive_tags_layout.addWidget(self.archive_all_tags_list, 0, 0, 3, 1)
-        archive_tags_layout.addWidget(QLabel("新标签名"), 0, 1)
-        archive_tags_layout.addWidget(self.archive_tag_new_name_edit, 1, 1)
-        archive_tag_buttons = QHBoxLayout()
-        archive_tag_buttons.addWidget(self.archive_tag_rename_button)
-        archive_tag_buttons.addWidget(self.archive_tag_merge_button)
-        archive_tag_buttons.addStretch()
-        archive_tags_layout.addLayout(archive_tag_buttons, 2, 1)
-        archive_tags_layout.setColumnStretch(0, 1)
-        archive_tags_layout.setColumnStretch(1, 2)
-        journal_layout.addWidget(archive_tags_box)
-
-        self.archive_papers_table = QTableWidget(0, 11)
-        self.archive_papers_table.setHorizontalHeaderLabels(
-            [
-                "期刊",
-                "发表时间",
-                "第一作者",
-                "第一作者中文",
-                "通讯作者",
-                "通讯作者中文",
-                "通讯作者单位",
-                "通讯作者单位中文",
-                "题目",
-                "中文题目",
-                "标签",
-            ]
-        )
-        self.archive_papers_table.setEditTriggers(QTableWidget.NoEditTriggers)
-        self.archive_papers_table.setSelectionBehavior(QTableWidget.SelectRows)
-        self.archive_papers_table.setSelectionMode(QTableWidget.SingleSelection)
-        self.archive_papers_table.verticalHeader().setVisible(False)
-        self.archive_papers_table.horizontalHeader().setStretchLastSection(True)
-        self.archive_papers_table.setSortingEnabled(True)
-        self.archive_papers_table.setColumnWidth(0, 230)
-        self.archive_papers_table.setColumnWidth(1, 110)
-        self.archive_papers_table.setColumnWidth(2, 160)
-        self.archive_papers_table.setColumnWidth(3, 160)
-        self.archive_papers_table.setColumnWidth(4, 160)
-        self.archive_papers_table.setColumnWidth(5, 160)
-        self.archive_papers_table.setColumnWidth(6, 260)
-        self.archive_papers_table.setColumnWidth(7, 260)
-        self.archive_papers_table.setColumnWidth(8, 320)
-        self.archive_papers_table.setColumnWidth(9, 320)
-        self.archive_papers_table.setColumnWidth(10, 180)
-        journal_layout.addWidget(self.archive_papers_table)
-
-        other_layout = QVBoxLayout(other_tab)
-        other_buttons = QHBoxLayout()
-        self.show_json_button = QPushButton("显示 JSON 内容")
-        self.show_prompt_button = QPushButton("显示模型交互")
-        other_buttons.addWidget(self.show_json_button)
-        other_buttons.addWidget(self.show_prompt_button)
-        other_buttons.addStretch()
-        other_layout.addLayout(other_buttons)
-        self.json_preview = QTextEdit()
-        self.json_preview.setReadOnly(True)
-        self.prompt_preview = QTextEdit()
-        self.prompt_preview.setReadOnly(True)
-        self.log = QTextEdit()
-        self.log.setReadOnly(True)
-        other_layout.addWidget(QLabel("JSON 内容"))
-        other_layout.addWidget(self.json_preview)
-        other_layout.addWidget(QLabel("模型提示词 / 交互内容"))
-        other_layout.addWidget(self.prompt_preview)
-        other_layout.addWidget(QLabel("日志"))
-        other_layout.addWidget(self.log)
-
-        self.import_button.clicked.connect(self.choose_pdf)
-        self.batch_import_button.clicked.connect(self.choose_pdfs)
-        self.remove_pdf_button.clicked.connect(self.remove_current_pdf)
-        self.parse_button.clicked.connect(self.parse_pdfs)
-        self.choose_archive_button.clicked.connect(self.choose_archive_root)
-        self.open_archive_button.clicked.connect(self.open_archive_root)
-        self.open_paper_folder_button.clicked.connect(self.load_archived_paper_folder)
-        self.archive_stats_button.clicked.connect(self.show_archive_stats)
-        self.validate_key_button.clicked.connect(self.validate_api_key)
-        self.save_key_button.clicked.connect(self.save_api_key)
-        self.provider_combo.currentIndexChanged.connect(self.apply_provider_preset)
-        self.prev_paper_button.clicked.connect(lambda: self.move_paper(-1))
-        self.next_paper_button.clicked.connect(lambda: self.move_paper(1))
-        self.save_info_button.clicked.connect(self.save_current_info)
-        self.save_note_button.clicked.connect(self.save_note)
-        self.show_json_button.clicked.connect(self.show_current_json)
-        self.show_prompt_button.clicked.connect(self.show_current_prompt)
-        self.scholar_button.clicked.connect(self.open_google_scholar)
-        self.journal_use_current_button.clicked.connect(self.use_current_journal)
-        self.journal_search_button.clicked.connect(self.lookup_journal)
-        self.journal_open_button.clicked.connect(self.open_journal_source)
-        self.archive_papers_refresh_button.clicked.connect(self.load_archive_papers_table)
-        self.archive_papers_open_button.clicked.connect(self.open_selected_archive_paper)
-        self.archive_search_edit.textChanged.connect(self.load_archive_papers_table)
-        self.archive_tag_filter_combo.currentIndexChanged.connect(self.load_archive_papers_table)
-        self.archive_filter_clear_button.clicked.connect(self.clear_archive_filters)
-        self.archive_all_tags_list.itemClicked.connect(self.on_archive_tag_clicked)
-        self.archive_tag_rename_button.clicked.connect(self.rename_selected_archive_tag)
-        self.archive_tag_merge_button.clicked.connect(self.merge_archive_same_name_tags)
-        self.archive_papers_table.cellDoubleClicked.connect(
-            lambda _row, _column: self.open_selected_archive_paper()
-        )
+        build_main_window(self)
+        connect_main_window_signals(self)
         self.apply_provider_preset()
         self.update_current_view()
         self.load_archive_papers_table()
-
-        self.setStyleSheet(
-            """
-            QMainWindow { background: #ffffff; }
-            QMenuBar {
-                background: #f8fafc;
-                border-bottom: 1px solid #e5e7eb;
-                padding: 3px 8px;
-            }
-            QMenuBar::item {
-                padding: 6px 10px;
-                background: transparent;
-            }
-            QMenuBar::item:selected { background: #e5e7eb; border-radius: 4px; }
-            QListWidget#navList {
-                border: none;
-                border-right: 1px solid #e5e7eb;
-                background: #f8fafc;
-                padding: 8px;
-            }
-            QListWidget#navList::item {
-                padding: 10px 12px;
-                border-radius: 6px;
-                color: #334155;
-            }
-            QListWidget#navList::item:selected {
-                background: #e2e8f0;
-                color: #0f172a;
-            }
-            QListWidget#archiveTagList {
-                border: 1px solid #cbd5e1;
-                border-radius: 6px;
-                background: #ffffff;
-            }
-            QListWidget#archiveTagList::item { padding: 5px 8px; }
-            QPushButton {
-                padding: 8px 12px;
-                border-radius: 6px;
-                border: 1px solid #cbd5e1;
-                background: #ffffff;
-            }
-            QPushButton:hover { background: #f1f5f9; }
-            QPushButton#parseButton {
-                color: #ffffff;
-                background: #2563eb;
-                border: 1px solid #1d4ed8;
-                font-weight: 700;
-            }
-            QPushButton#parseButton:hover { background: #1d4ed8; }
-            QPushButton#parseButton:disabled {
-                color: #dbeafe;
-                background: #93c5fd;
-                border-color: #93c5fd;
-            }
-            QGroupBox {
-                font-weight: 600;
-                border: 1px solid #d1d5db;
-                border-radius: 8px;
-                margin-top: 10px;
-                padding-top: 14px;
-            }
-            QLineEdit, QTextEdit, QComboBox {
-                border: 1px solid #cbd5e1;
-                border-radius: 6px;
-                padding: 6px;
-            }
-            """
-        )
+        apply_main_window_styles(self)
 
     def create_menu_bar(self) -> None:
         file_menu = self.menuBar().addMenu("文件")
@@ -1177,6 +707,39 @@ class MainWindow(QMainWindow):
         self.log_message(message.replace("\n", "；"))
         QMessageBox.information(self, "归档日志", message)
 
+    def organize_archive_papers(self) -> None:
+        root = self.archive_root()
+        if not root.exists():
+            QMessageBox.information(self, "归档目录不存在", f"找不到归档目录：\n{root}")
+            return
+        summary = organize_archive_payloads(root)
+        for item in self.paper_items:
+            if item.folder and (item.folder / "metadata.json").exists():
+                payload = read_metadata_file(item.folder / "metadata.json")
+                item.metadata = metadata_from_dict(payload)
+                item.json_payload = payload
+                item.note = stringify(payload.get("manual_notes"))
+        self.update_current_view()
+        self.load_archive_papers_table()
+
+        changed_parts = [
+            f"{name}×{count}"
+            for name, count in sorted(summary.changed_fields.items())
+        ]
+        changed_text = "、".join(changed_parts) if changed_parts else "无"
+        message = (
+            f"已扫描 {summary.scanned} 个 metadata.json。\n"
+            f"已整理 {summary.updated} 个，跳过 {summary.skipped} 个，失败 {summary.failed} 个。\n"
+            f"补齐/更新字段：{changed_text}"
+        )
+        if summary.errors:
+            message += "\n\n失败示例：\n" + "\n".join(summary.errors[:5])
+        self.status.setText(
+            f"归档整理完成：更新 {summary.updated} 个，跳过 {summary.skipped} 个，失败 {summary.failed} 个。"
+        )
+        self.log_message(message.replace("\n", " "))
+        QMessageBox.information(self, "一键整理归档完成", message)
+
     def load_archive_papers_table(self) -> None:
         rows = archived_paper_rows(self.archive_root())
         tag_counts: dict[str, int] = {}
@@ -1321,26 +884,14 @@ class MainWindow(QMainWindow):
         self.load_archive_papers_table()
 
     def rewrite_archive_tags(self, old_tag: str = "", new_tag: str = "") -> int:
-        changed_count = 0
-        for folder, _metadata in archived_paper_rows(self.archive_root()):
-            payload = read_metadata_file(folder / "metadata.json")
-            raw_value = payload.get("tags", [])
-            if isinstance(raw_value, list):
-                raw_tags = raw_value
-            else:
-                raw_tags = str(raw_value or "").replace("，", ",").replace("、", ",").split(",")
-            old_tags = [str(tag).strip() for tag in raw_tags if str(tag).strip()]
-            rewritten_tags: list[str] = []
-            for clean_tag in old_tags:
-                replacement = new_tag if old_tag and clean_tag == old_tag else clean_tag
-                if replacement and replacement not in rewritten_tags:
-                    rewritten_tags.append(replacement)
-            if rewritten_tags == old_tags:
-                continue
-            payload["tags"] = rewritten_tags
-            write_metadata_file(folder, payload)
-            self.update_loaded_item_from_payload(folder, payload)
-            changed_count += 1
+        changed_count = rewrite_archive_tags_in_store(
+            self.archive_root(), old_tag, new_tag
+        )
+        if changed_count:
+            for item in self.paper_items:
+                if item.folder and (item.folder / "metadata.json").exists():
+                    payload = read_metadata_file(item.folder / "metadata.json")
+                    self.update_loaded_item_from_payload(item.folder, payload)
         return changed_count
 
     def archive_row_matches(

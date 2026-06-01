@@ -3,7 +3,14 @@ from pathlib import Path
 from PyQt5.QtCore import QThread, pyqtSignal
 
 from .api_client import build_prompt, call_openai_compatible_api, extract_document_text, validate_openai_compatible_api
-from .archive_store import archive_paper, find_duplicate, metadata_is_complete, pdf_hash, write_metadata_file
+from .archive_store import (
+    archive_paper,
+    find_duplicate,
+    metadata_is_complete,
+    normalize_metadata_payload,
+    pdf_hash,
+    write_metadata_file,
+)
 from .external_lookup import google_scholar_author_url, query_journal_partitions
 from .metadata import metadata_from_dict
 from .models import ApiConfig, PaperItem, PaperMetadata
@@ -37,6 +44,11 @@ class ParseWorker(QThread):
                     self.archive_root, paper_hash=pdf_hash(pdf_path), pdf_path=pdf_path
                 )
                 if old_folder and old_payload:
+                    old_payload, changed_fields = normalize_metadata_payload(
+                        old_folder, old_payload
+                    )
+                    if changed_fields:
+                        write_metadata_file(old_folder, old_payload)
                     old_metadata = metadata_from_dict(old_payload)
                     if initial_tags:
                         merged_tags = unique_tags(old_metadata.tags + initial_tags)
